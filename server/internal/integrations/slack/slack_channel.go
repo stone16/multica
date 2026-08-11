@@ -175,18 +175,7 @@ func (c *slackChannel) handleSocketEvent(ctx context.Context, sm *socketmode.Cli
 // infrastructure failure; it propagates so the supervisor reconnects. A
 // legitimate product drop returns nil.
 func (c *slackChannel) dispatchEventsAPI(ctx context.Context, e slackevents.EventsAPIEvent, mentionRe *regexp.Regexp) error {
-	var (
-		msg channel.InboundMessage
-		ok  bool
-	)
-	switch inner := e.InnerEvent.Data.(type) {
-	case *slackevents.AppMentionEvent:
-		msg, ok = inboundFromAppMention(e, inner, c.botUserID, mentionRe)
-	case *slackevents.MessageEvent:
-		msg, ok = inboundFromMessage(e, inner, c.botUserID, mentionRe)
-	default:
-		return nil
-	}
+	msg, ok := translateEventsAPI(e, c.botUserID, mentionRe)
 	if !ok {
 		return nil
 	}

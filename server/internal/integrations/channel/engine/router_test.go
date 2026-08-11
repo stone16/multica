@@ -816,6 +816,9 @@ func TestRouter_IssueCommand_Creates(t *testing.T) {
 	if h.issues.params.OriginType.String != "lark_chat" {
 		t.Fatalf("origin_type must come from the resolver set, got %q", h.issues.params.OriginType.String)
 	}
+	if h.issues.opts.OriginChannelMessageID != h.binder.appendResult.MessageID {
+		t.Fatalf("origin channel message = %v, want appended message %v", h.issues.opts.OriginChannelMessageID, h.binder.appendResult.MessageID)
+	}
 	if h.tasks.calls() != 0 {
 		t.Fatalf("direct issue create must not also enqueue a chat task, calls=%d", h.tasks.calls())
 	}

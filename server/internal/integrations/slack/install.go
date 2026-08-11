@@ -51,10 +51,13 @@ type installQueries interface {
 	WithTx(tx pgx.Tx) installQueries
 	UpsertChannelInstallation(ctx context.Context, arg db.UpsertChannelInstallationParams) (db.ChannelInstallation, error)
 	ReclaimDeadChannelInstallationByAppID(ctx context.Context, arg db.ReclaimDeadChannelInstallationByAppIDParams) (pgtype.UUID, error)
+	GetChannelInstallationIdentityForUpdate(ctx context.Context, arg db.GetChannelInstallationIdentityForUpdateParams) (db.GetChannelInstallationIdentityForUpdateRow, error)
+	ClearChannelInstallationIdentityState(ctx context.Context, arg db.ClearChannelInstallationIdentityStateParams) error
 	GetChannelInstallationOwnerByAppID(ctx context.Context, arg db.GetChannelInstallationOwnerByAppIDParams) (db.GetChannelInstallationOwnerByAppIDRow, error)
 	ListChannelInstallationsByWorkspace(ctx context.Context, arg db.ListChannelInstallationsByWorkspaceParams) ([]db.ChannelInstallation, error)
 	GetChannelInstallationInWorkspace(ctx context.Context, arg db.GetChannelInstallationInWorkspaceParams) (db.ChannelInstallation, error)
 	SetChannelInstallationStatus(ctx context.Context, arg db.SetChannelInstallationStatusParams) error
+	CancelIssueChannelNotificationsByInstallation(ctx context.Context, arg db.CancelIssueChannelNotificationsByInstallationParams) error
 }
 
 // dbInstallQueries adapts *db.Queries to installQueries — the generated WithTx
@@ -130,6 +133,9 @@ type installPersist struct {
 	// app_id inside configJSON. It keys the dead-owner reclaim and the live-owner
 	// lookup that drives the accurate conflict message.
 	appIDKey string
+	// teamID is the Slack workspace identity served by the bot token. Slack ids
+	// and bindings must be retired when it changes, even if the app id is stable.
+	teamID string
 	// configJSON holds the Slack app id (config->>'app_id') used for inbound
 	// routing; the ROW itself is keyed by (workspace, agent) — one bot per agent.
 	configJSON []byte
@@ -147,8 +153,10 @@ const pgUniqueViolation = "23505"
 // and it is NOT this upsert's conflict target, so a unique violation here means
 // the pasted Slack app is already connected to a DIFFERENT agent or Multica
 // workspace — refuse it (ErrTeamOwnedByAnotherWorkspace) rather than steal it.
-// No chat-session retire is needed: a row's agent_id never changes (it is part
-// of the key), so existing sessions stay valid for the same agent.
+// Same-app, same-team reconnects keep existing sessions. Swapping app_id or
+// team_id changes the external Slack identity even though the row id and agent
+// stay the same, so persistInstall retires all installation-owned identity and
+// routing state before updating the row.
 func (s *InstallService) persistInstall(ctx context.Context, p installPersist) (db.ChannelInstallation, error) {
 	tx, err := s.tx.Begin(ctx)
 	if err != nil {
@@ -170,6 +178,24 @@ func (s *InstallService) persistInstall(ctx context.Context, p installPersist) (
 	}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		// pgx.ErrNoRows just means nothing was dead — a no-op, not a failure.
 		return db.ChannelInstallation{}, fmt.Errorf("reclaim dead slack installation: %w", err)
+	}
+	current, currentErr := qtx.GetChannelInstallationIdentityForUpdate(ctx, db.GetChannelInstallationIdentityForUpdateParams{
+		WorkspaceID: p.wsID,
+		AgentID:     p.agentID,
+		ChannelType: string(TypeSlack),
+	})
+	if currentErr != nil && !errors.Is(currentErr, pgx.ErrNoRows) {
+		return db.ChannelInstallation{}, fmt.Errorf("lock current Slack installation: %w", currentErr)
+	}
+	if currentErr == nil && (current.AppID != p.appIDKey || current.TeamID != p.teamID) {
+		if err := qtx.ClearChannelInstallationIdentityState(ctx, db.ClearChannelInstallationIdentityStateParams{
+			InstallationID: current.ID,
+			WorkspaceID:    p.wsID,
+			AgentID:        p.agentID,
+			ChannelType:    string(TypeSlack),
+		}); err != nil {
+			return db.ChannelInstallation{}, fmt.Errorf("retire changed Slack identity state: %w", err)
+		}
 	}
 
 	inst, err := qtx.UpsertChannelInstallation(ctx, db.UpsertChannelInstallationParams{
@@ -248,8 +274,25 @@ func (s *InstallService) GetInWorkspace(ctx context.Context, id, wsID pgtype.UUI
 // (ListActiveInstallations filters to active), so its Socket Mode connection
 // winds down, and outbound drops too.
 func (s *InstallService) Revoke(ctx context.Context, id pgtype.UUID) error {
-	return s.q.SetChannelInstallationStatus(ctx, db.SetChannelInstallationStatusParams{
+	tx, err := s.tx.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin Slack revoke tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := s.q.WithTx(tx)
+	if err := qtx.SetChannelInstallationStatus(ctx, db.SetChannelInstallationStatusParams{
 		ID:     id,
 		Status: "revoked",
-	})
+	}); err != nil {
+		return err
+	}
+	if err := qtx.CancelIssueChannelNotificationsByInstallation(ctx, db.CancelIssueChannelNotificationsByInstallationParams{
+		InstallationID: id, Reason: "installation_revoked",
+	}); err != nil {
+		return fmt.Errorf("cancel Slack issue notifications: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit Slack revoke: %w", err)
+	}
+	return nil
 }

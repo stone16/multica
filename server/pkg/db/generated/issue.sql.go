@@ -1276,22 +1276,22 @@ func (q *Queries) LockIssueForDelete(ctx context.Context, arg LockIssueForDelete
 	return id, err
 }
 
-const lockIssueForDescriptionUpdate = `-- name: LockIssueForDescriptionUpdate :one
+const lockIssueForUpdate = `-- name: LockIssueForUpdate :one
 SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties FROM issue
 WHERE id = $1 AND workspace_id = $2
 FOR UPDATE
 `
 
-type LockIssueForDescriptionUpdateParams struct {
+type LockIssueForUpdateParams struct {
 	ID          pgtype.UUID `json:"id"`
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
 }
 
-// Serialize user description saves with detached channel-media appends. The
-// handler merges channel media that landed after the editor's submitted base
-// while holding this lock, then performs UpdateIssue in the same transaction.
-func (q *Queries) LockIssueForDescriptionUpdate(ctx context.Context, arg LockIssueForDescriptionUpdateParams) (Issue, error) {
-	row := q.db.QueryRow(ctx, lockIssueForDescriptionUpdate, arg.ID, arg.WorkspaceID)
+// Serialize issue updates with detached channel-media appends and status-driven
+// outbox transitions. The caller performs UpdateIssue and any dependent writes
+// in the same transaction.
+func (q *Queries) LockIssueForUpdate(ctx context.Context, arg LockIssueForUpdateParams) (Issue, error) {
+	row := q.db.QueryRow(ctx, lockIssueForUpdate, arg.ID, arg.WorkspaceID)
 	var i Issue
 	err := row.Scan(
 		&i.ID,

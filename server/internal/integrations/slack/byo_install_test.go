@@ -283,6 +283,9 @@ func TestRegisterBYO_ReconnectSameAgent_UpdatesRowInPlace(t *testing.T) {
 			WorkspaceID: mustUUID(t, "11111111-1111-1111-1111-111111111111"),
 			AgentID:     mustUUID(t, "22222222-2222-2222-2222-222222222222"),
 		},
+		currentIdentity: db.GetChannelInstallationIdentityForUpdateRow{
+			ID: existingID, AppID: "A-previous-app", TeamID: "T999",
+		},
 	}
 	svc := newTestInstallService(t, q)
 	svc.apiURL = srv.URL + "/"
@@ -296,6 +299,38 @@ func TestRegisterBYO_ReconnectSameAgent_UpdatesRowInPlace(t *testing.T) {
 	}
 	if row.ID != existingID {
 		t.Errorf("reconnect should reuse the agent's existing row %v, got %v", existingID, row.ID)
+	}
+	if q.clearedIdentity.InstallationID != existingID {
+		t.Errorf("changed Slack app should retire old identity for %v, got %+v", existingID, q.clearedIdentity)
+	}
+}
+
+func TestRegisterBYO_ReconnectSameAppInDifferentTeam_RetiresOldIdentity(t *testing.T) {
+	srv := authTestServer(t, true)
+	defer srv.Close()
+	existingID := mustUUID(t, "55555555-5555-5555-5555-555555555555")
+	q := &fakeInstallQueries{
+		rowID: existingID,
+		existing: &db.ChannelInstallation{
+			ID:          existingID,
+			WorkspaceID: mustUUID(t, "11111111-1111-1111-1111-111111111111"),
+			AgentID:     mustUUID(t, "22222222-2222-2222-2222-222222222222"),
+		},
+		currentIdentity: db.GetChannelInstallationIdentityForUpdateRow{
+			ID: existingID, AppID: "A0BCXGVCS7R", TeamID: "T-previous-workspace",
+		},
+	}
+	svc := newTestInstallService(t, q)
+	svc.apiURL = srv.URL + "/"
+
+	if _, err := svc.RegisterBYO(context.Background(), byoParams(
+		"11111111-1111-1111-1111-111111111111",
+		"22222222-2222-2222-2222-222222222222",
+	)); err != nil {
+		t.Fatalf("RegisterBYO: %v", err)
+	}
+	if q.clearedIdentity.InstallationID != existingID {
+		t.Errorf("same app installed to a different Slack team should retire old identity for %v, got %+v", existingID, q.clearedIdentity)
 	}
 }
 

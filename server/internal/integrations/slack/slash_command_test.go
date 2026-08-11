@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/slack-go/slack"
 
+	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -48,17 +49,17 @@ type fakeQuickCreate struct {
 	workspaceID pgtype.UUID
 	requesterID pgtype.UUID
 	agentID     pgtype.UUID
-	squadID     pgtype.UUID
 	prompt      string
+	target      service.SlackQuickCreateTarget
 }
 
-func (f *fakeQuickCreate) EnqueueQuickCreateTask(_ context.Context, workspaceID, requesterID, agentID, squadID pgtype.UUID, prompt, _, _ string, _, _ pgtype.UUID, _ []pgtype.UUID) (db.AgentTaskQueue, error) {
+func (f *fakeQuickCreate) EnqueueSlackQuickCreateTask(_ context.Context, workspaceID, requesterID, agentID pgtype.UUID, prompt string, target service.SlackQuickCreateTarget) (db.AgentTaskQueue, error) {
 	f.calls++
 	f.workspaceID = workspaceID
 	f.requesterID = requesterID
 	f.agentID = agentID
-	f.squadID = squadID
 	f.prompt = prompt
+	f.target = target
 	return f.task, f.err
 }
 
@@ -151,8 +152,8 @@ func TestSlashHandle_EnqueuesQuickCreateAndAcks(t *testing.T) {
 	if tasks.requesterID != slashTestUUID(9) {
 		t.Errorf("quick-create requester is not the bound member")
 	}
-	if tasks.squadID.Valid {
-		t.Errorf("slash-command quick-create must not carry a squad id")
+	if tasks.target.InstallationID != slashTestUUID(1) || tasks.target.ChannelID != "C1" {
+		t.Errorf("slash-command callback target = %+v, want validated installation/channel", tasks.target)
 	}
 }
 

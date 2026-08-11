@@ -190,7 +190,11 @@ on it. These are the contracts, not advice:
   members work, and only move to `in_review` when a later re-trigger confirms
   the overall goal is met.
 - **`in_review`** is an accepted issue status. Some workflows use it while a PR
-  is open and awaiting review; moving to it is an explicit mutation.
+  is open and awaiting review; moving to it is an explicit mutation. For an
+  issue that originated from Slack, the first transition to `in_review`
+  durably queues a server-owned notification back to the exact originating
+  Slack thread. Do not post a duplicate completion message yourself; keep the
+  detailed handoff and evidence in the Multica issue.
 - **`done`** on a child issue posts a system comment on its parent. If a PR
   carries close intent (`Closes MUL-XXXX`), it advances the issue to `done`
   itself on merge — you do not also need to flip it manually.

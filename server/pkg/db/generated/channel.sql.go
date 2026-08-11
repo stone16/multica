@@ -110,7 +110,11 @@ ON CONFLICT (installation_id, message_id) DO UPDATE
         claim_token = gen_random_uuid()
     WHERE channel_inbound_message_dedup.processed_at IS NULL
       AND channel_inbound_message_dedup.received_at < now() - INTERVAL '60 seconds'
-RETURNING installation_id, message_id, received_at, processed_at, claim_token
+RETURNING channel_inbound_message_dedup.installation_id,
+          channel_inbound_message_dedup.message_id,
+          channel_inbound_message_dedup.received_at,
+          channel_inbound_message_dedup.processed_at,
+          channel_inbound_message_dedup.claim_token
 `
 
 type ClaimChannelInboundDedupParams struct {
@@ -251,6 +255,92 @@ WHERE chat_session_id = $1
 
 func (q *Queries) ClearChannelChatSessionPendingFresh(ctx context.Context, chatSessionID pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, clearChannelChatSessionPendingFresh, chatSessionID)
+	return err
+}
+
+const clearChannelInstallationIdentityState = `-- name: ClearChannelInstallationIdentityState :exec
+WITH target AS (
+    SELECT ci.id FROM channel_installation ci
+    WHERE ci.id = $1
+      AND ci.workspace_id = $2
+      AND ci.agent_id = $3
+      AND ci.channel_type = $4
+    FOR UPDATE
+),
+cancelled_issue_notifications AS (
+    UPDATE issue_channel_notification
+    SET status = 'cancelled', cancelled_at = now(),
+        last_error = 'Slack installation identity changed',
+        lease_token = NULL, lease_expires_at = NULL, updated_at = now()
+    WHERE installation_id IN (SELECT id FROM target)
+      AND status IN ('awaiting', 'queued', 'reconciling')
+    RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
+),
+audited_issue_notification_cancellations AS (
+    INSERT INTO issue_channel_notification_audit (
+        issue_id, workspace_id, created_by_task_id, installation_id,
+        event_type, error, details
+    )
+    SELECT issue_id, workspace_id, created_by_task_id, installation_id,
+           'cancelled', last_error, jsonb_build_object('reason', 'installation_identity_changed')
+    FROM cancelled_issue_notifications
+),
+cleared_chat_sessions AS (
+    DELETE FROM channel_chat_session_binding
+    WHERE installation_id IN (SELECT id FROM target)
+    RETURNING chat_session_id
+),
+cleared_outbound_cards AS (
+    DELETE FROM channel_outbound_card_message
+    WHERE chat_session_id IN (SELECT chat_session_id FROM cleared_chat_sessions)
+),
+cleared_binding_tokens AS (
+    DELETE FROM channel_binding_token
+    WHERE installation_id IN (SELECT id FROM target)
+),
+cleared_user_bindings AS (
+    DELETE FROM channel_user_binding
+    WHERE installation_id IN (SELECT id FROM target)
+),
+cleared_inbound_dedup AS (
+    DELETE FROM channel_inbound_message_dedup
+    WHERE installation_id IN (SELECT id FROM target)
+),
+detached_audit AS (
+    UPDATE channel_inbound_audit SET installation_id = NULL
+    WHERE installation_id IN (SELECT id FROM target)
+),
+detached_media_intents AS (
+    UPDATE channel_media_pending_object SET installation_id = NULL
+    WHERE installation_id IN (SELECT id FROM target)
+)
+SELECT count(*)::bigint FROM target
+`
+
+type ClearChannelInstallationIdentityStateParams struct {
+	InstallationID pgtype.UUID `json:"installation_id"`
+	WorkspaceID    pgtype.UUID `json:"workspace_id"`
+	AgentID        pgtype.UUID `json:"agent_id"`
+	ChannelType    string      `json:"channel_type"`
+}
+
+// A channel installation row may be updated in place when an agent reconnects,
+// but its installation-scoped state must not cross an external identity
+// boundary. Slack user ids, DM ids, message ids, and binding tokens are scoped
+// to the app/team represented by the credentials, so changing app_id or team_id
+// clears all routing and identity state before the config update commits.
+//
+// Chat sessions remain as history. Audit and media-intent rows remain useful
+// for diagnostics/reconciliation, so they survive with installation_id NULL.
+// The owner predicate and row lock keep this cleanup tied to the exact logical
+// installation that persistInstall inspected in the same transaction.
+func (q *Queries) ClearChannelInstallationIdentityState(ctx context.Context, arg ClearChannelInstallationIdentityStateParams) error {
+	_, err := q.db.Exec(ctx, clearChannelInstallationIdentityState,
+		arg.InstallationID,
+		arg.WorkspaceID,
+		arg.AgentID,
+		arg.ChannelType,
+	)
 	return err
 }
 
@@ -547,8 +637,35 @@ func (q *Queries) DeleteChannelChatSessionBindingBySession(ctx context.Context, 
 }
 
 const deleteChannelChatSessionBindingsByInstallation = `-- name: DeleteChannelChatSessionBindingsByInstallation :exec
-DELETE FROM channel_chat_session_binding
-WHERE installation_id = $1 AND channel_type = $2
+WITH cleared_chat_sessions AS (
+    DELETE FROM channel_chat_session_binding
+    WHERE channel_chat_session_binding.installation_id = $1
+      AND channel_chat_session_binding.channel_type = $2
+    RETURNING chat_session_id
+),
+cleared_outbound_cards AS (
+    DELETE FROM channel_outbound_card_message
+    WHERE chat_session_id IN (SELECT chat_session_id FROM cleared_chat_sessions)
+),
+cancelled_issue_notifications AS (
+    UPDATE issue_channel_notification
+    SET status = 'cancelled', cancelled_at = now(),
+        last_error = 'Originating channel binding retired',
+        lease_token = NULL, lease_expires_at = NULL, updated_at = now()
+    WHERE issue_channel_notification.installation_id = $1
+      AND status IN ('awaiting', 'queued', 'reconciling')
+    RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
+),
+audited_issue_notification_cancellations AS (
+    INSERT INTO issue_channel_notification_audit (
+        issue_id, workspace_id, created_by_task_id, installation_id,
+        event_type, error, details
+    )
+    SELECT issue_id, workspace_id, created_by_task_id, installation_id,
+           'cancelled', last_error, jsonb_build_object('reason', 'channel_binding_retired')
+    FROM cancelled_issue_notifications
+)
+SELECT count(*)::bigint FROM cleared_chat_sessions
 `
 
 type DeleteChannelChatSessionBindingsByInstallationParams struct {
@@ -562,7 +679,8 @@ type DeleteChannelChatSessionBindingsByInstallationParams struct {
 // so reusing it would keep routing the conversation to the OLD agent. Dropping
 // the bindings forces the next inbound message to create a fresh session under
 // the new agent. The chat_session rows are preserved for history; only the
-// channel binding is removed.
+// channel binding is removed. The notification row has the same terminal
+// dependency on this installation and must retire atomically with the binding.
 func (q *Queries) DeleteChannelChatSessionBindingsByInstallation(ctx context.Context, arg DeleteChannelChatSessionBindingsByInstallationParams) error {
 	_, err := q.db.Exec(ctx, deleteChannelChatSessionBindingsByInstallation, arg.InstallationID, arg.ChannelType)
 	return err
@@ -574,6 +692,14 @@ WITH doomed AS (
     WHERE agent_id IN (
         SELECT id FROM agent WHERE runtime_id = $1 AND kind = 'system'
     )
+),
+cleared_issue_notification_audit AS (
+    DELETE FROM issue_channel_notification_audit
+    WHERE installation_id IN (SELECT id FROM doomed)
+),
+cleared_issue_notifications AS (
+    DELETE FROM issue_channel_notification
+    WHERE installation_id IN (SELECT id FROM doomed)
 ),
 cleared_chat_sessions AS (
     DELETE FROM channel_chat_session_binding WHERE installation_id IN (SELECT id FROM doomed)
@@ -1014,6 +1140,39 @@ func (q *Queries) GetChannelInstallationByAppID(ctx context.Context, arg GetChan
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
+	return i, err
+}
+
+const getChannelInstallationIdentityForUpdate = `-- name: GetChannelInstallationIdentityForUpdate :one
+SELECT id,
+       COALESCE(config ->> 'app_id', '')::text AS app_id,
+       COALESCE(config ->> 'team_id', '')::text AS team_id
+FROM channel_installation
+WHERE workspace_id = $1
+  AND agent_id = $2
+  AND channel_type = $3
+FOR UPDATE
+`
+
+type GetChannelInstallationIdentityForUpdateParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	AgentID     pgtype.UUID `json:"agent_id"`
+	ChannelType string      `json:"channel_type"`
+}
+
+type GetChannelInstallationIdentityForUpdateRow struct {
+	ID     pgtype.UUID `json:"id"`
+	AppID  string      `json:"app_id"`
+	TeamID string      `json:"team_id"`
+}
+
+// Installation-scoped bindings are valid only for one external tenant. Slack
+// app_id identifies the app, while team_id identifies the Slack workspace the
+// bot token serves; changing either value establishes a new identity boundary.
+func (q *Queries) GetChannelInstallationIdentityForUpdate(ctx context.Context, arg GetChannelInstallationIdentityForUpdateParams) (GetChannelInstallationIdentityForUpdateRow, error) {
+	row := q.db.QueryRow(ctx, getChannelInstallationIdentityForUpdate, arg.WorkspaceID, arg.AgentID, arg.ChannelType)
+	var i GetChannelInstallationIdentityForUpdateRow
+	err := row.Scan(&i.ID, &i.AppID, &i.TeamID)
 	return i, err
 }
 
@@ -1535,6 +1694,14 @@ WITH dead AS (
          OR NOT EXISTS (SELECT 1 FROM agent a WHERE a.id = ci.agent_id)
       )
     RETURNING ci.id
+),
+cleared_issue_notification_audit AS (
+    DELETE FROM issue_channel_notification_audit
+    WHERE installation_id IN (SELECT id FROM dead)
+),
+cleared_issue_notifications AS (
+    DELETE FROM issue_channel_notification
+    WHERE installation_id IN (SELECT id FROM dead)
 ),
 cleared_chat_sessions AS (
     DELETE FROM channel_chat_session_binding

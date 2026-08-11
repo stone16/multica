@@ -55,9 +55,14 @@ type fakeInstallQueries struct {
 	reclaimCalled bool
 	// ownerWorkspaceID / ownerArchived / ownerMissing drive the live-owner lookup
 	// that classifies an appIDTaken conflict into the right sentinel.
-	ownerWorkspaceID pgtype.UUID
-	ownerArchived    bool
-	ownerMissing     bool
+	ownerWorkspaceID      pgtype.UUID
+	ownerArchived         bool
+	ownerMissing          bool
+	statusParams          db.SetChannelInstallationStatusParams
+	cancelledNotification db.CancelIssueChannelNotificationsByInstallationParams
+	currentIdentity       db.GetChannelInstallationIdentityForUpdateRow
+	currentIdentityErr    error
+	clearedIdentity       db.ClearChannelInstallationIdentityStateParams
 }
 
 // WithTx returns the same fake — the fake tx is a no-op token.
@@ -69,6 +74,21 @@ func (f *fakeInstallQueries) ReclaimDeadChannelInstallationByAppID(_ context.Con
 		return *f.reclaimedID, nil
 	}
 	return pgtype.UUID{}, pgx.ErrNoRows
+}
+
+func (f *fakeInstallQueries) GetChannelInstallationIdentityForUpdate(_ context.Context, _ db.GetChannelInstallationIdentityForUpdateParams) (db.GetChannelInstallationIdentityForUpdateRow, error) {
+	if f.currentIdentityErr != nil {
+		return db.GetChannelInstallationIdentityForUpdateRow{}, f.currentIdentityErr
+	}
+	if !f.currentIdentity.ID.Valid {
+		return db.GetChannelInstallationIdentityForUpdateRow{}, pgx.ErrNoRows
+	}
+	return f.currentIdentity, nil
+}
+
+func (f *fakeInstallQueries) ClearChannelInstallationIdentityState(_ context.Context, p db.ClearChannelInstallationIdentityStateParams) error {
+	f.clearedIdentity = p
+	return nil
 }
 
 func (f *fakeInstallQueries) GetChannelInstallationOwnerByAppID(_ context.Context, _ db.GetChannelInstallationOwnerByAppIDParams) (db.GetChannelInstallationOwnerByAppIDRow, error) {
@@ -110,7 +130,12 @@ func (f *fakeInstallQueries) GetChannelInstallationInWorkspace(_ context.Context
 	return db.ChannelInstallation{}, nil
 }
 
-func (f *fakeInstallQueries) SetChannelInstallationStatus(_ context.Context, _ db.SetChannelInstallationStatusParams) error {
+func (f *fakeInstallQueries) SetChannelInstallationStatus(_ context.Context, p db.SetChannelInstallationStatusParams) error {
+	f.statusParams = p
+	return nil
+}
+func (f *fakeInstallQueries) CancelIssueChannelNotificationsByInstallation(_ context.Context, p db.CancelIssueChannelNotificationsByInstallationParams) error {
+	f.cancelledNotification = p
 	return nil
 }
 
@@ -136,4 +161,27 @@ func newTestInstallService(t *testing.T, q installQueries) *InstallService {
 		t.Fatalf("newInstallService: %v", err)
 	}
 	return svc
+}
+
+func TestInstallService_RevokeCancelsIssueNotificationsAtomically(t *testing.T) {
+	queries := &fakeInstallQueries{}
+	tx := &fakeTx{}
+	svc, err := newInstallService(queries, &fakeTxStarter{tx: tx}, testBox(t), nil)
+	if err != nil {
+		t.Fatalf("newInstallService: %v", err)
+	}
+	installationID := mustUUID(t, "11111111-1111-4111-8111-111111111111")
+
+	if err := svc.Revoke(context.Background(), installationID); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+	if queries.statusParams.ID != installationID || queries.statusParams.Status != "revoked" {
+		t.Fatalf("status update = %+v", queries.statusParams)
+	}
+	if queries.cancelledNotification.InstallationID != installationID || queries.cancelledNotification.Reason != "installation_revoked" {
+		t.Fatalf("notification cancellation = %+v, want installation revoke", queries.cancelledNotification)
+	}
+	if !tx.committed {
+		t.Fatal("revoke and notification cleanup did not commit atomically")
+	}
 }

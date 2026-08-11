@@ -393,6 +393,8 @@ type ChatMessage struct {
 	ChannelMediaPendingUntil pgtype.Timestamptz `json:"channel_media_pending_until"`
 	ChannelIngested          bool               `json:"channel_ingested"`
 	QuickActions             []byte             `json:"quick_actions"`
+	ChannelMessageID         pgtype.Text        `json:"channel_message_id"`
+	ChannelThreadID          pgtype.Text        `json:"channel_thread_id"`
 }
 
 type ChatPinnedAgent struct {
@@ -650,6 +652,50 @@ type Issue struct {
 	Metadata           []byte             `json:"metadata"`
 	Stage              pgtype.Int4        `json:"stage"`
 	Properties         []byte             `json:"properties"`
+}
+
+type IssueChannelNotification struct {
+	IssueID                pgtype.UUID        `json:"issue_id"`
+	WorkspaceID            pgtype.UUID        `json:"workspace_id"`
+	CreatedByTaskID        pgtype.UUID        `json:"created_by_task_id"`
+	InitiatorUserID        pgtype.UUID        `json:"initiator_user_id"`
+	ChatSessionID          pgtype.UUID        `json:"chat_session_id"`
+	InstallationID         pgtype.UUID        `json:"installation_id"`
+	ChannelType            string             `json:"channel_type"`
+	ChannelAppID           string             `json:"channel_app_id"`
+	ChannelTeamID          string             `json:"channel_team_id"`
+	ChannelID              string             `json:"channel_id"`
+	ThreadTs               string             `json:"thread_ts"`
+	Status                 string             `json:"status"`
+	AvailableAt            pgtype.Timestamptz `json:"available_at"`
+	LeaseToken             pgtype.UUID        `json:"lease_token"`
+	LeaseExpiresAt         pgtype.Timestamptz `json:"lease_expires_at"`
+	Attempts               int32              `json:"attempts"`
+	ReconciliationAttempts int32              `json:"reconciliation_attempts"`
+	LastError              pgtype.Text        `json:"last_error"`
+	SlackMessageTs         pgtype.Text        `json:"slack_message_ts"`
+	DeliveredAt            pgtype.Timestamptz `json:"delivered_at"`
+	FailedAt               pgtype.Timestamptz `json:"failed_at"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	QueuedAt               pgtype.Timestamptz `json:"queued_at"`
+	CancelledAt            pgtype.Timestamptz `json:"cancelled_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+}
+
+type IssueChannelNotificationAudit struct {
+	ID              pgtype.UUID        `json:"id"`
+	IssueID         pgtype.UUID        `json:"issue_id"`
+	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
+	CreatedByTaskID pgtype.UUID        `json:"created_by_task_id"`
+	InstallationID  pgtype.UUID        `json:"installation_id"`
+	EventType       string             `json:"event_type"`
+	Phase           pgtype.Text        `json:"phase"`
+	AttemptNumber   pgtype.Int4        `json:"attempt_number"`
+	LeaseToken      pgtype.UUID        `json:"lease_token"`
+	SlackMessageTs  pgtype.Text        `json:"slack_message_ts"`
+	Error           pgtype.Text        `json:"error"`
+	Details         []byte             `json:"details"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 }
 
 type IssueDependency struct {

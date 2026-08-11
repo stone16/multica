@@ -617,6 +617,13 @@ func (h *Handler) SetChatSessionArchived(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusInternalServerError, "failed to clear chat session channel binding")
 			return
 		}
+		if err := qtx.CancelIssueChannelNotificationsByChatSession(r.Context(), db.CancelIssueChannelNotificationsByChatSessionParams{
+			ChatSessionID: session.ID,
+			Reason:        "chat_session_archived",
+		}); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to clear chat session issue notifications")
+			return
+		}
 	}
 
 	if err := tx.Commit(r.Context()); err != nil {
@@ -705,6 +712,13 @@ func (h *Handler) DeleteChatSession(w http.ResponseWriter, r *http.Request) {
 	// prune the binding here in the same tx that deletes its chat_session.
 	if err := qtx.DeleteChannelChatSessionBindingBySession(r.Context(), session.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to delete chat session binding")
+		return
+	}
+	if err := qtx.CancelIssueChannelNotificationsByChatSession(r.Context(), db.CancelIssueChannelNotificationsByChatSessionParams{
+		ChatSessionID: session.ID,
+		Reason:        "chat_session_deleted",
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete chat session issue notifications")
 		return
 	}
 	// channel_outbound_card_message is also keyed by chat_session_id with no FK

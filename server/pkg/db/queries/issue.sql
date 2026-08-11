@@ -88,10 +88,10 @@ SELECT id FROM issue
 WHERE id = $1 AND workspace_id = $2
 FOR KEY SHARE;
 
--- name: LockIssueForDescriptionUpdate :one
--- Serialize user description saves with detached channel-media appends. The
--- handler merges channel media that landed after the editor's submitted base
--- while holding this lock, then performs UpdateIssue in the same transaction.
+-- name: LockIssueForUpdate :one
+-- Serialize issue updates with detached channel-media appends and status-driven
+-- outbox transitions. The caller performs UpdateIssue and any dependent writes
+-- in the same transaction.
 SELECT * FROM issue
 WHERE id = $1 AND workspace_id = $2
 FOR UPDATE;

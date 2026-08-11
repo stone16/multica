@@ -254,7 +254,7 @@ func TestDescriptionUpdateLockSerializesLaterChannelMediaAppend(t *testing.T) {
 		t.Fatalf("begin description transaction: %v", err)
 	}
 	defer descriptionTx.Rollback(ctx)
-	if _, err := db.New(testPool).WithTx(descriptionTx).LockIssueForDescriptionUpdate(ctx, db.LockIssueForDescriptionUpdateParams{
+	if _, err := db.New(testPool).WithTx(descriptionTx).LockIssueForUpdate(ctx, db.LockIssueForUpdateParams{
 		ID: issueID, WorkspaceID: workspaceID,
 	}); err != nil {
 		t.Fatalf("lock issue for description update: %v", err)

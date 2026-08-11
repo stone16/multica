@@ -12,6 +12,7 @@ import (
 	"github.com/slack-go/slack"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
+	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -31,9 +32,12 @@ import (
 // background, so the issue gets a proper title + structured description instead
 // of the raw one-liner the user typed. Because creation is asynchronous, the
 // command replies with a PRIVATE (ephemeral) acknowledgement via the command's
-// response_url — there is no issue number to hand back yet — and the agent's
-// completion surfaces to the invoker as a Multica inbox notification through the
-// shared quick-create completion path. It starts no chat session / chat run.
+// response_url — there is no issue number to hand back yet — and durably stores
+// the signed command channel so the issue's review-ready handoff can be posted
+// there. Slash commands carry no source message timestamp, so this is an
+// explicit channel-level callback, not a fabricated thread reply. The agent's
+// completion also keeps the existing Multica inbox notification. It starts no
+// chat session / chat run.
 //
 // The installation routing and identity + membership checks mirror the message
 // path (resolvers.go) so a slash-command quick-create respects the same
@@ -66,7 +70,7 @@ type slashQueries interface {
 // command needs to hand the invoker's prompt to the agent. *service.TaskService
 // satisfies it; tests supply a fake.
 type quickCreateEnqueuer interface {
-	EnqueueQuickCreateTask(ctx context.Context, workspaceID, requesterID, agentID, squadID pgtype.UUID, prompt, priority, dueDate string, projectID, parentIssueID pgtype.UUID, attachmentIDs []pgtype.UUID) (db.AgentTaskQueue, error)
+	EnqueueSlackQuickCreateTask(ctx context.Context, workspaceID, requesterID, agentID pgtype.UUID, prompt string, target service.SlackQuickCreateTarget) (db.AgentTaskQueue, error)
 }
 
 // SlashCommandProcessor handles the Slack `/issue` slash command end to end.
@@ -184,18 +188,13 @@ func (p *SlashCommandProcessor) process(ctx context.Context, cmd slack.SlashComm
 	// background and attributes it to the bound member. No project / parent /
 	// attachments and no squad routing — the slash command targets the
 	// installation's own agent directly.
-	if _, err := p.tasks.EnqueueQuickCreateTask(
+	if _, err := p.tasks.EnqueueSlackQuickCreateTask(
 		ctx,
 		inst.WorkspaceID,
 		userID,
 		inst.AgentID,
-		pgtype.UUID{}, // no squad — dispatch straight to the installation agent
 		prompt,
-		"",            // no explicit priority
-		"",            // no explicit due date
-		pgtype.UUID{}, // no project
-		pgtype.UUID{}, // no parent issue
-		nil,           // no attachments
+		service.SlackQuickCreateTarget{InstallationID: inst.ID, ChannelID: cmd.ChannelID},
 	); err != nil {
 		p.logger.WarnContext(ctx, "slack slash command: enqueue quick-create failed",
 			"app_id", cmd.APIAppID, "error", err)

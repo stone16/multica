@@ -282,7 +282,8 @@ func TestAppendUserMessage_PlainText(t *testing.T) {
 	f := newFake()
 	s := newTestSession(f)
 	res, err := s.AppendUserMessage(context.Background(), AppendInput{
-		SessionID: uid(1), Sender: uid(7), Body: "hello there", MessageID: "m1",
+		SessionID: uid(1), Sender: uid(7), Body: "hello there",
+		MessageID: "1700000000.000200", ThreadID: "1700000000.000100",
 	})
 	if err != nil {
 		t.Fatalf("AppendUserMessage: %v", err)
@@ -295,6 +296,12 @@ func TestAppendUserMessage_PlainText(t *testing.T) {
 	}
 	if f.touched != 1 || f.replyTargets != 1 {
 		t.Errorf("touched=%d replyTargets=%d, want 1/1", f.touched, f.replyTargets)
+	}
+	if f.lastCreate.ChannelMessageID != (pgtype.Text{String: "1700000000.000200", Valid: true}) {
+		t.Fatalf("channel message id = %+v, want immutable inbound message id", f.lastCreate.ChannelMessageID)
+	}
+	if f.lastCreate.ChannelThreadID != (pgtype.Text{String: "1700000000.000100", Valid: true}) {
+		t.Fatalf("channel thread id = %+v, want immutable inbound thread id", f.lastCreate.ChannelThreadID)
 	}
 }
 

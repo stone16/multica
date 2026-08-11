@@ -10,6 +10,26 @@ import (
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 )
 
+// TranslateEventsAPI is the Slack Events API boundary shared by Socket Mode
+// and integration tests. It normalizes one parsed envelope using the installed
+// bot identity and returns false for events the Slack adapter intentionally
+// ignores. Keeping the type switch here prevents production and test ingress
+// from growing separate translation paths.
+func TranslateEventsAPI(e slackevents.EventsAPIEvent, botUserID string) (channel.InboundMessage, bool) {
+	return translateEventsAPI(e, botUserID, compileMentionRe(botUserID))
+}
+
+func translateEventsAPI(e slackevents.EventsAPIEvent, botUserID string, mentionRe *regexp.Regexp) (channel.InboundMessage, bool) {
+	switch inner := e.InnerEvent.Data.(type) {
+	case *slackevents.AppMentionEvent:
+		return inboundFromAppMention(e, inner, botUserID, mentionRe)
+	case *slackevents.MessageEvent:
+		return inboundFromMessage(e, inner, botUserID, mentionRe)
+	default:
+		return channel.InboundMessage{}, false
+	}
+}
+
 // This file holds the platform-neutral translation from a Slack Events API
 // payload to the engine's normalized channel.InboundMessage. These are free
 // functions parameterized by the bot identity rather than methods on the

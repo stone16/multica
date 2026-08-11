@@ -131,6 +131,9 @@ and is hidden from the PR list.
 | Status change (incl. → `cancelled`) does NOT cancel in-flight tasks; only issue deletion does (MUL-4465) | no-cancel note in `server/internal/handler/issue.go:2652-2658` (`UpdateIssue`) and `:3170-3171` (`BatchUpdateIssues`); deletion still cancels at `:2863` (`DeleteIssue`) / `:3239` (`BatchDeleteIssues`) via `CancelTasksForIssue` (`server/internal/service/task.go:1229`) | new citation |
 | `StartTask` / `CompleteTask` do not write issue status (agent CLI owns progress) | `server/internal/service/task.go` (`StartTask` / `CompleteTask` comments) | new citation |
 | Assignment brief: ordinary agent `in_progress` then `in_review`; squad leader `in_progress` only on first dispatch | `server/internal/daemon/execenv/runtime_config_sections.go` (`writeWorkflowAssignment`) | new citation |
+| First transition of a Slack-origin issue to `in_review` durably queues one server-owned thread notification | `server/internal/handler/issue.go` (`queueIssueChannelNotificationIfReady`); `server/pkg/db/queries/issue_channel_notification.sql` (`QueueIssueChannelNotification`) | new citation |
+| Notification correlation uses the exact immutable Slack input message; agent runs use the task-owned `channel_ingested` batch | `server/pkg/db/queries/issue_channel_notification.sql` (`CreateIssueChannelNotificationFromOrigin`); `server/internal/integrations/channel/engine/session.go` (`AppendUserMessage`) | new citation |
+| Server worker owns Slack delivery, idempotent metadata reconciliation, retry, and terminal read-only reconciliation; agents must not duplicate it | `server/internal/handler/issue_channel_notification_worker.go`; `server/internal/integrations/slack/issue_notification.go` | new citation |
 | Failed task may roll `in_progress` → `todo` when no active task remains | `server/internal/service/task.go` (`HandleFailedTasks`) | new citation |
 
 Creation with `--status todo` (or any non-backlog status) on an agent-assigned

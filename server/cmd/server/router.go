@@ -548,6 +548,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			slackTyping.Register(bus)
 			channelRouter.Register(slack.TypeSlack, slack.NewSlackResolverSet(queries, pool, slackReplier, slackTyping))
 			slack.NewOutbound(queries, box.Open, slog.Default()).Register(bus)
+			h.IssueChannelNotificationWorker = handler.NewIssueChannelNotificationWorker(
+				queries,
+				slack.NewIssueNotification(queries, box.Open, appURLFromEnv()),
+			)
 
 			// On-demand history reader behind the unified `multica chat history`
 			// command (MUL-3871): pull the session's Slack conversation when the

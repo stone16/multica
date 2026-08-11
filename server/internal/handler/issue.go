@@ -2821,54 +2821,88 @@ func refreshUntouchedNullableIssueParams(params *db.UpdateIssueParams, current d
 	}
 }
 
-func (h *Handler) updateIssueWithDescriptionMerge(ctx context.Context, workspaceID pgtype.UUID, params db.UpdateIssueParams, rawFields map[string]json.RawMessage, base *string) (db.Issue, db.Issue, error) {
+// updateIssueAtomically serializes the issue mutation and its durable channel
+// notification transition. The row lock also gives callers the authoritative
+// pre-update issue for status_changed/event payloads under concurrent writes.
+func (h *Handler) updateIssueAtomically(ctx context.Context, workspaceID pgtype.UUID, params db.UpdateIssueParams, rawFields map[string]json.RawMessage) (db.Issue, db.Issue, error) {
+	return h.updateIssueAtomicallyWithPreparation(ctx, workspaceID, params, rawFields, nil)
+}
+
+type issueUpdatePreparation func(context.Context, *db.Queries, db.Issue, *db.UpdateIssueParams) error
+
+func (h *Handler) updateIssueAtomicallyWithPreparation(ctx context.Context, workspaceID pgtype.UUID, params db.UpdateIssueParams, rawFields map[string]json.RawMessage, prepare issueUpdatePreparation) (db.Issue, db.Issue, error) {
 	if h.TxStarter == nil {
-		return db.Issue{}, db.Issue{}, errors.New("issue description update requires transaction starter")
+		return db.Issue{}, db.Issue{}, errors.New("issue update requires transaction starter")
 	}
 	tx, err := h.TxStarter.Begin(ctx)
 	if err != nil {
-		return db.Issue{}, db.Issue{}, fmt.Errorf("begin issue description update: %w", err)
+		return db.Issue{}, db.Issue{}, fmt.Errorf("begin issue update: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
 	qtx := h.Queries.WithTx(tx)
-	current, err := qtx.LockIssueForDescriptionUpdate(ctx, db.LockIssueForDescriptionUpdateParams{
-		ID:          params.ID,
-		WorkspaceID: workspaceID,
+	current, err := qtx.LockIssueForUpdate(ctx, db.LockIssueForUpdateParams{
+		ID: params.ID, WorkspaceID: workspaceID,
 	})
 	if err != nil {
-		return db.Issue{}, db.Issue{}, fmt.Errorf("lock issue description: %w", err)
+		return db.Issue{}, db.Issue{}, fmt.Errorf("lock issue update: %w", err)
 	}
-	attachments, err := qtx.ListAttachmentsByIssue(ctx, db.ListAttachmentsByIssueParams{
-		IssueID:     current.ID,
-		WorkspaceID: current.WorkspaceID,
-	})
-	if err != nil {
-		return db.Issue{}, db.Issue{}, fmt.Errorf("list issue attachments for description merge: %w", err)
-	}
-
-	currentDescription := ""
-	if current.Description.Valid {
-		currentDescription = current.Description.String
-	}
-	incomingDescription := ""
-	if params.Description.Valid {
-		incomingDescription = params.Description.String
-	}
-	params.Description = pgtype.Text{
-		String: mergeIssueChannelMediaDescription(currentDescription, incomingDescription, base, attachments),
-		Valid:  true,
+	if prepare != nil {
+		if err := prepare(ctx, qtx, current, &params); err != nil {
+			return db.Issue{}, db.Issue{}, err
+		}
 	}
 	refreshUntouchedNullableIssueParams(&params, current, rawFields)
-
 	issue, err := qtx.UpdateIssue(ctx, params)
 	if err != nil {
-		return db.Issue{}, db.Issue{}, fmt.Errorf("update locked issue description: %w", err)
+		return db.Issue{}, db.Issue{}, fmt.Errorf("update locked issue: %w", err)
+	}
+	if err := queueIssueChannelNotificationIfReady(ctx, qtx, current, issue); err != nil {
+		return db.Issue{}, db.Issue{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return db.Issue{}, db.Issue{}, fmt.Errorf("commit issue description update: %w", err)
+		return db.Issue{}, db.Issue{}, fmt.Errorf("commit issue update: %w", err)
 	}
 	return issue, current, nil
+}
+
+func (h *Handler) updateIssueWithDescriptionMerge(ctx context.Context, workspaceID pgtype.UUID, params db.UpdateIssueParams, rawFields map[string]json.RawMessage, base *string) (db.Issue, db.Issue, error) {
+	return h.updateIssueAtomicallyWithPreparation(ctx, workspaceID, params, rawFields,
+		func(ctx context.Context, qtx *db.Queries, current db.Issue, prepared *db.UpdateIssueParams) error {
+			attachments, err := qtx.ListAttachmentsByIssue(ctx, db.ListAttachmentsByIssueParams{
+				IssueID: current.ID, WorkspaceID: current.WorkspaceID,
+			})
+			if err != nil {
+				return fmt.Errorf("list issue attachments for description merge: %w", err)
+			}
+			currentDescription := ""
+			if current.Description.Valid {
+				currentDescription = current.Description.String
+			}
+			incomingDescription := ""
+			if prepared.Description.Valid {
+				incomingDescription = prepared.Description.String
+			}
+			prepared.Description = pgtype.Text{
+				String: mergeIssueChannelMediaDescription(currentDescription, incomingDescription, base, attachments),
+				Valid:  true,
+			}
+			return nil
+		},
+	)
+}
+
+func queueIssueChannelNotificationIfReady(ctx context.Context, q *db.Queries, previous, issue db.Issue) error {
+	if previous.Status == "in_review" || issue.Status != "in_review" {
+		return nil
+	}
+	_, err := q.QueueIssueChannelNotification(ctx, db.QueueIssueChannelNotificationParams{
+		IssueID: issue.ID, WorkspaceID: issue.WorkspaceID,
+	})
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("queue issue channel notification: %w", err)
+	}
+	return nil
 }
 
 func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
@@ -3076,7 +3110,11 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 			prevIssue = lockedPrev
 		}
 	} else {
-		issue, err = h.Queries.UpdateIssue(r.Context(), params)
+		var lockedPrev db.Issue
+		issue, lockedPrev, err = h.updateIssueAtomically(r.Context(), prevIssue.WorkspaceID, params, rawFields)
+		if err == nil {
+			prevIssue = lockedPrev
+		}
 	}
 	if err != nil {
 		slog.Warn("update issue failed", append(logger.RequestAttrs(r), "error", err, "issue_id", id, "workspace_id", workspaceID)...)
@@ -3171,6 +3209,9 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	// fails best-effort.
 	if statusChanged {
 		h.notifyParentOfChildDone(r.Context(), prevIssue, issue)
+		if issue.Status == "in_review" && h.IssueChannelNotificationWorker != nil {
+			h.IssueChannelNotificationWorker.Notify()
+		}
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -3399,6 +3440,11 @@ func (h *Handler) deleteIssueAndCollectAttachmentURLs(ctx context.Context, issue
 	attachmentURLs, err := qtx.ListAttachmentURLsByIssueOrComments(ctx, issue.ID)
 	if err != nil {
 		return nil, fmt.Errorf("list issue attachment URLs: %w", err)
+	}
+	if err := qtx.DeleteIssueChannelNotificationByIssue(ctx, db.DeleteIssueChannelNotificationByIssueParams{
+		IssueID: issue.ID, WorkspaceID: issue.WorkspaceID,
+	}); err != nil {
+		return nil, fmt.Errorf("delete issue channel notification: %w", err)
 	}
 	if err := qtx.DeleteIssue(ctx, db.DeleteIssueParams{
 		ID:          issue.ID,
@@ -3680,7 +3726,11 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 				prevIssue = lockedPrev
 			}
 		} else {
-			issue, err = h.Queries.UpdateIssue(r.Context(), params)
+			var lockedPrev db.Issue
+			issue, lockedPrev, err = h.updateIssueAtomically(r.Context(), prevIssue.WorkspaceID, params, rawUpdates)
+			if err == nil {
+				prevIssue = lockedPrev
+			}
 		}
 		if err != nil {
 			slog.Warn("batch update issue failed", "issue_id", issueID, "error", err)
@@ -3737,6 +3787,9 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		if statusChanged && issue.ParentIssueID.Valid &&
 			!isTerminalChildStatus(prevIssue.Status) && isTerminalChildStatus(issue.Status) {
 			childDoneCompleted = append(childDoneCompleted, issue)
+		}
+		if statusChanged && issue.Status == "in_review" && h.IssueChannelNotificationWorker != nil {
+			h.IssueChannelNotificationWorker.Notify()
 		}
 
 		updated++

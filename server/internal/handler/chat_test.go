@@ -726,15 +726,22 @@ func TestDeleteChatSession_PrunesChannelRows(t *testing.T) {
 	const appID = "cli_chat_delete_binding"
 	const channelChatID = "oc_chat_delete_binding"
 	const cardMsgID = "om_chat_delete_card"
+	var notificationIssueID string
 
 	// channel_* rows have no FK to chat_session/workspace (MUL-3515 §4), so
 	// they outlive the helper's chat_session cleanup; clear by deterministic
 	// key before and after.
 	cleanChannel := func() {
+		if notificationIssueID != "" {
+			_, _ = testPool.Exec(context.Background(),
+				`DELETE FROM issue_channel_notification_audit WHERE issue_id = $1`, notificationIssueID)
+		}
 		_, _ = testPool.Exec(context.Background(),
 			`DELETE FROM channel_chat_session_binding WHERE channel_chat_id = $1`, channelChatID)
 		_, _ = testPool.Exec(context.Background(),
 			`DELETE FROM channel_outbound_card_message WHERE channel_card_message_id = $1`, cardMsgID)
+		_, _ = testPool.Exec(context.Background(),
+			`DELETE FROM issue_channel_notification WHERE chat_session_id = $1`, sessionID)
 		_, _ = testPool.Exec(context.Background(),
 			`DELETE FROM channel_installation WHERE channel_type = 'feishu' AND config->>'app_id' = $1`, appID)
 	}
@@ -762,6 +769,16 @@ INSERT INTO channel_outbound_card_message (chat_session_id, channel_type, channe
 VALUES ($1, 'feishu', $2, $3, 'final')
 `, sessionID, channelChatID, cardMsgID); err != nil {
 		t.Fatalf("insert channel_outbound_card_message: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `
+INSERT INTO issue_channel_notification (
+    issue_id, workspace_id, initiator_user_id, chat_session_id, installation_id,
+    channel_type, channel_app_id, channel_team_id, channel_id, thread_ts
+) VALUES (gen_random_uuid(), $1, $2, $3, $4, 'slack', 'A-delete-test', 'T-delete-test',
+          'C-delete-test', '1700000000.1')
+RETURNING issue_id
+`, testWorkspaceID, testUserID, sessionID, installID).Scan(&notificationIssueID); err != nil {
+		t.Fatalf("insert issue_channel_notification: %v", err)
 	}
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/chat/sessions/"+sessionID, nil)
@@ -792,6 +809,25 @@ VALUES ($1, 'feishu', $2, $3, 'final')
 	if cardExists {
 		t.Fatal("deleted chat session's channel_outbound_card_message was not pruned (no reaper would ever collect it)")
 	}
+	var notificationStatus string
+	if err := testPool.QueryRow(ctx,
+		`SELECT status FROM issue_channel_notification WHERE issue_id = $1`, notificationIssueID).Scan(&notificationStatus); err != nil {
+		t.Fatalf("query issue channel notification: %v", err)
+	}
+	if notificationStatus != "cancelled" {
+		t.Fatalf("deleted chat session notification status = %q, want cancelled", notificationStatus)
+	}
+	var cancelledAuditCount int
+	if err := testPool.QueryRow(ctx, `
+SELECT count(*) FROM issue_channel_notification_audit
+WHERE issue_id = $1 AND event_type = 'cancelled'
+  AND details ->> 'reason' = 'chat_session_deleted'
+`, notificationIssueID).Scan(&cancelledAuditCount); err != nil {
+		t.Fatalf("query issue channel notification audit: %v", err)
+	}
+	if cancelledAuditCount != 1 {
+		t.Fatalf("deleted chat session cancellation audit rows = %d, want 1", cancelledAuditCount)
+	}
 }
 
 // TestSetChatSessionArchived_ClearsChannelBinding verifies the archive path
@@ -808,12 +844,19 @@ func TestSetChatSessionArchived_ClearsChannelBinding(t *testing.T) {
 
 	const appID = "cli_chat_archive_binding"
 	const channelChatID = "oc_chat_archive_binding"
+	var notificationIssueID string
 
 	// channel_* rows have no FK to chat_session/workspace (MUL-3515 §4), so they
 	// outlive the helper's chat_session cleanup; clear by deterministic key.
 	cleanChannel := func() {
+		if notificationIssueID != "" {
+			_, _ = testPool.Exec(context.Background(),
+				`DELETE FROM issue_channel_notification_audit WHERE issue_id = $1`, notificationIssueID)
+		}
 		_, _ = testPool.Exec(context.Background(),
 			`DELETE FROM channel_chat_session_binding WHERE channel_chat_id = $1`, channelChatID)
+		_, _ = testPool.Exec(context.Background(),
+			`DELETE FROM issue_channel_notification WHERE chat_session_id = $1`, sessionID)
 		_, _ = testPool.Exec(context.Background(),
 			`DELETE FROM channel_installation WHERE channel_type = 'feishu' AND config->>'app_id' = $1`, appID)
 	}
@@ -834,6 +877,16 @@ INSERT INTO channel_chat_session_binding (chat_session_id, installation_id, chan
 VALUES ($1, $2, 'feishu', $3, 'p2p')
 `, sessionID, installID, channelChatID); err != nil {
 		t.Fatalf("insert channel_chat_session_binding: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `
+INSERT INTO issue_channel_notification (
+    issue_id, workspace_id, initiator_user_id, chat_session_id, installation_id,
+    channel_type, channel_app_id, channel_team_id, channel_id, thread_ts
+) VALUES (gen_random_uuid(), $1, $2, $3, $4, 'slack', 'A-archive-test', 'T-archive-test',
+          'C-archive-test', '1700000000.2')
+RETURNING issue_id
+`, testWorkspaceID, testUserID, sessionID, installID).Scan(&notificationIssueID); err != nil {
+		t.Fatalf("insert issue_channel_notification: %v", err)
 	}
 
 	archive := func(archived bool) {
@@ -868,6 +921,25 @@ VALUES ($1, $2, 'feishu', $3, 'p2p')
 	archive(true)
 	if bindingExists() {
 		t.Fatal("archived chat session's channel_chat_session_binding was not cleared")
+	}
+	var notificationStatus string
+	if err := testPool.QueryRow(ctx,
+		`SELECT status FROM issue_channel_notification WHERE issue_id = $1`, notificationIssueID).Scan(&notificationStatus); err != nil {
+		t.Fatalf("query archived notification: %v", err)
+	}
+	if notificationStatus != "cancelled" {
+		t.Fatalf("archived chat session notification status = %q, want cancelled", notificationStatus)
+	}
+	var cancelledAuditCount int
+	if err := testPool.QueryRow(ctx, `
+SELECT count(*) FROM issue_channel_notification_audit
+WHERE issue_id = $1 AND event_type = 'cancelled'
+  AND details ->> 'reason' = 'chat_session_archived'
+`, notificationIssueID).Scan(&cancelledAuditCount); err != nil {
+		t.Fatalf("query archived notification audit: %v", err)
+	}
+	if cancelledAuditCount != 1 {
+		t.Fatalf("archived chat session cancellation audit rows = %d, want 1", cancelledAuditCount)
 	}
 
 	var status string

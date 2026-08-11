@@ -62,6 +62,12 @@ ws_agents AS (
 ws_skills AS (
     SELECT id FROM skill WHERE workspace_id = $1
 ),
+cleared_issue_channel_notifications AS (
+    DELETE FROM issue_channel_notification WHERE workspace_id = $1
+),
+cleared_issue_channel_notification_audit AS (
+    DELETE FROM issue_channel_notification_audit WHERE workspace_id = $1
+),
 cleared_agent_label_assignments AS (
     DELETE FROM agent_to_label WHERE agent_id IN (SELECT id FROM ws_agents)
 ),

@@ -189,15 +189,16 @@ type Handler struct {
 	// May be nil in tests / self-hosted with the metrics listener disabled;
 	// every Record* method is nil-safe and obsmetrics.RecordEvent treats a
 	// nil Metrics as "PostHog only".
-	Metrics                      *obsmetrics.BusinessMetrics
-	PATCache                     *auth.PATCache
-	DaemonTokenCache             *auth.DaemonTokenCache
-	MembershipCache              *auth.MembershipCache
-	WebhookRateLimiter           WebhookRateLimiter
-	WebhookIPRateLimiter         WebhookRateLimiter
-	WebhookAbsoluteIPRateLimiter WebhookRateLimiter
-	WebhookDeliveryWorker        *WebhookDeliveryWorker
-	CloudRuntime                 cloudRuntimeProxy
+	Metrics                        *obsmetrics.BusinessMetrics
+	PATCache                       *auth.PATCache
+	DaemonTokenCache               *auth.DaemonTokenCache
+	MembershipCache                *auth.MembershipCache
+	WebhookRateLimiter             WebhookRateLimiter
+	WebhookIPRateLimiter           WebhookRateLimiter
+	WebhookAbsoluteIPRateLimiter   WebhookRateLimiter
+	WebhookDeliveryWorker          *WebhookDeliveryWorker
+	IssueChannelNotificationWorker *IssueChannelNotificationWorker
+	CloudRuntime                   cloudRuntimeProxy
 	// Lark integration. All three are nil when the Lark master key
 	// (MULTICA_LARK_SECRET_KEY) is unset; the corresponding HTTP
 	// handlers return 503 in that case so a misconfigured self-host

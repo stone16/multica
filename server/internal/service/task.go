@@ -1424,6 +1424,27 @@ const QuickCreateContextType = "quick_create"
 // open the modal from "Add sub issue"). The handler is responsible for
 // validating it belongs to the same workspace before passing it in.
 func (s *TaskService) EnqueueQuickCreateTask(ctx context.Context, workspaceID, requesterID pgtype.UUID, agentID, squadID pgtype.UUID, prompt, priority, dueDate string, projectID, parentIssueID pgtype.UUID, attachmentIDs []pgtype.UUID) (db.AgentTaskQueue, error) {
+	return s.enqueueQuickCreateTask(ctx, workspaceID, requesterID, agentID, squadID, prompt, priority, dueDate, projectID, parentIssueID, attachmentIDs, nil)
+}
+
+// SlackQuickCreateTarget is validated installation/channel correlation captured
+// from Slack's signed slash-command envelope. Slack slash commands have no
+// source message timestamp, so their eventual issue notification is posted at
+// channel level rather than claiming to be a thread reply.
+type SlackQuickCreateTarget struct {
+	InstallationID pgtype.UUID
+	ChannelID      string
+}
+
+// EnqueueSlackQuickCreateTask commits the task and its durable Slack callback
+// target atomically. A task without a target could complete successfully while
+// leaving the requester with no callback, so the slash acknowledgement is only
+// returned after both rows exist.
+func (s *TaskService) EnqueueSlackQuickCreateTask(ctx context.Context, workspaceID, requesterID pgtype.UUID, agentID pgtype.UUID, prompt string, target SlackQuickCreateTarget) (db.AgentTaskQueue, error) {
+	return s.enqueueQuickCreateTask(ctx, workspaceID, requesterID, agentID, pgtype.UUID{}, prompt, "", "", pgtype.UUID{}, pgtype.UUID{}, nil, &target)
+}
+
+func (s *TaskService) enqueueQuickCreateTask(ctx context.Context, workspaceID, requesterID pgtype.UUID, agentID, squadID pgtype.UUID, prompt, priority, dueDate string, projectID, parentIssueID pgtype.UUID, attachmentIDs []pgtype.UUID, slackTarget *SlackQuickCreateTarget) (db.AgentTaskQueue, error) {
 	agent, err := s.Queries.GetAgent(ctx, agentID)
 	if err != nil {
 		return db.AgentTaskQueue{}, fmt.Errorf("load agent: %w", err)
@@ -1482,7 +1503,20 @@ func (s *TaskService) EnqueueQuickCreateTask(ctx context.Context, workspaceID, r
 	}
 	attrSource, _, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, requesterID, agent)
-	task, err := s.Queries.CreateQuickCreateTask(ctx, db.CreateQuickCreateTaskParams{
+	queries := s.Queries
+	var tx pgx.Tx
+	if slackTarget != nil {
+		if s.TxStarter == nil {
+			return db.AgentTaskQueue{}, errors.New("Slack quick-create requires transaction starter")
+		}
+		tx, err = s.TxStarter.Begin(ctx)
+		if err != nil {
+			return db.AgentTaskQueue{}, fmt.Errorf("begin Slack quick-create: %w", err)
+		}
+		defer tx.Rollback(ctx)
+		queries = s.Queries.WithTx(tx)
+	}
+	task, err := queries.CreateQuickCreateTask(ctx, db.CreateQuickCreateTaskParams{
 		AgentID:              agentID,
 		RuntimeID:            agent.RuntimeID,
 		Priority:             priorityToInt("high"),
@@ -1497,6 +1531,20 @@ func (s *TaskService) EnqueueQuickCreateTask(ctx context.Context, workspaceID, r
 	})
 	if err != nil {
 		return db.AgentTaskQueue{}, fmt.Errorf("create quick-create task: %w", err)
+	}
+	if slackTarget != nil {
+		if _, err := queries.CreateSlackSlashIssueChannelNotificationTarget(ctx, db.CreateSlackSlashIssueChannelNotificationTargetParams{
+			WorkspaceID:     workspaceID,
+			InitiatorUserID: requesterID,
+			CreatedByTaskID: task.ID,
+			InstallationID:  slackTarget.InstallationID,
+			ChannelID:       slackTarget.ChannelID,
+		}); err != nil {
+			return db.AgentTaskQueue{}, fmt.Errorf("create Slack quick-create notification target: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return db.AgentTaskQueue{}, fmt.Errorf("commit Slack quick-create: %w", err)
+		}
 	}
 
 	slog.Info("quick-create task enqueued",
@@ -5501,6 +5549,24 @@ func (s *TaskService) notifyQuickCreateCompleted(ctx context.Context, task db.Ag
 		)
 		s.notifyQuickCreateFailed(ctx, task, qc, detail)
 		return
+	}
+	// Native Slack /issue creates its durable channel target at ingestion time,
+	// before an issue exists. Bind that target to the deterministically located
+	// quick-created issue now. A missing row means this was an ordinary web
+	// quick-create; any other error is visible in logs while the periodic worker
+	// leaves the unattached target inert rather than guessing a destination.
+	if _, targetErr := s.Queries.AttachIssueChannelNotificationFromOrigin(ctx, db.AttachIssueChannelNotificationFromOriginParams{
+		IssueID:         issue.ID,
+		WorkspaceID:     workspaceID,
+		OriginType:      "quick_create",
+		OriginID:        task.ID,
+		InitiatorUserID: requesterID,
+	}); targetErr != nil && !errors.Is(targetErr, pgx.ErrNoRows) {
+		slog.Error("quick-create completion: attach Slack notification target failed",
+			"task_id", util.UUIDToString(task.ID),
+			"issue_id", util.UUIDToString(issue.ID),
+			"error", targetErr,
+		)
 	}
 
 	// Link the new issue back to this task so subsequent reads of the task

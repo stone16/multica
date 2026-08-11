@@ -47,6 +47,14 @@ WITH retired AS (
       AND ci.channel_type = 'dingtalk'
     RETURNING ci.id
 ),
+cleared_issue_notification_audit AS (
+    DELETE FROM issue_channel_notification_audit
+    WHERE installation_id IN (SELECT id FROM retired)
+),
+cleared_issue_notifications AS (
+    DELETE FROM issue_channel_notification
+    WHERE installation_id IN (SELECT id FROM retired)
+),
 cleared_chat_sessions AS (
     DELETE FROM channel_chat_session_binding
     WHERE installation_id IN (SELECT id FROM retired)

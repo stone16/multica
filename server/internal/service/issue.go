@@ -114,6 +114,11 @@ type IssueCreateOpts struct {
 	// metadata at the handler layer.
 	Platform string
 
+	// OriginChannelMessageID identifies the exact durable inbound channel
+	// message behind a synchronous /issue command. Agent-created issues leave
+	// this empty and resolve through the acting task's owned input batch.
+	OriginChannelMessageID pgtype.UUID
+
 	// AssignedAgentRunFireAt creates the automatic assigned-agent task in a
 	// durable deferred state. Channel /issue uses this while detached media is
 	// still resolving, then promotes the returned task after attachment binding.
@@ -311,6 +316,30 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 	}
 	if err != nil {
 		return IssueCreateResult{}, fmt.Errorf("create issue: %w", err)
+	}
+
+	// Persist the originating Slack thread while the trusted origin task/session
+	// and the issue are committed together. Non-Slack origins deliberately
+	// return no row; they are not notification failures.
+	if p.OriginType.Valid && p.OriginID.Valid {
+		_, notificationErr := qtx.AttachIssueChannelNotificationFromOrigin(ctx, db.AttachIssueChannelNotificationFromOriginParams{
+			IssueID:         issue.ID,
+			WorkspaceID:     issue.WorkspaceID,
+			OriginType:      p.OriginType.String,
+			OriginID:        p.OriginID,
+			InitiatorUserID: p.CreatorID,
+			OriginMessageID: opts.OriginChannelMessageID,
+		})
+		if notificationErr != nil && !errors.Is(notificationErr, pgx.ErrNoRows) {
+			return IssueCreateResult{}, fmt.Errorf("create issue channel notification: %w", notificationErr)
+		}
+		if issue.Status == "in_review" {
+			if _, notificationErr = qtx.QueueIssueChannelNotification(ctx, db.QueueIssueChannelNotificationParams{
+				IssueID: issue.ID, WorkspaceID: issue.WorkspaceID,
+			}); notificationErr != nil && !errors.Is(notificationErr, pgx.ErrNoRows) {
+				return IssueCreateResult{}, fmt.Errorf("queue issue channel notification: %w", notificationErr)
+			}
+		}
 	}
 
 	// Attach labels inside the create transaction so the issue and its
