@@ -25,13 +25,13 @@ const (
 )
 
 type issueChannelNotificationSender interface {
-	Send(context.Context, db.IssueChannelNotification) (channelslack.IssueNotificationResult, error)
-	Reconcile(context.Context, db.IssueChannelNotification) (channelslack.IssueNotificationResult, bool, error)
+	Send(context.Context, db.DBTX, db.IssueChannelNotification) (channelslack.IssueNotificationResult, error)
+	Reconcile(context.Context, db.DBTX, db.IssueChannelNotification) (channelslack.IssueNotificationResult, bool, error)
 }
 
 type issueChannelNotificationQueries interface {
 	ClaimQueuedIssueChannelNotification(context.Context) (db.IssueChannelNotification, error)
-	AuditClaimedIssueChannelNotificationAttempt(context.Context, db.AuditClaimedIssueChannelNotificationAttemptParams) (pgtype.UUID, error)
+	AuditClaimedIssueChannelNotificationAttempt(context.Context, db.AuditClaimedIssueChannelNotificationAttemptParams) (db.AuditClaimedIssueChannelNotificationAttemptRow, error)
 	DeferClaimedIssueChannelNotification(context.Context, db.DeferClaimedIssueChannelNotificationParams) (db.IssueChannelNotification, error)
 	DeliverClaimedIssueChannelNotification(context.Context, db.DeliverClaimedIssueChannelNotificationParams) (pgtype.UUID, error)
 	FailClaimedIssueChannelNotification(context.Context, db.FailClaimedIssueChannelNotificationParams) (pgtype.UUID, error)
@@ -48,14 +48,19 @@ type issueChannelNotificationQueries interface {
 // accepted-response window on the next attempt.
 type IssueChannelNotificationWorker struct {
 	queries issueChannelNotificationQueries
+	tx      issueChannelNotificationTxStarter
 	sender  issueChannelNotificationSender
 	notify  chan struct{}
 	done    chan struct{}
 }
 
-func NewIssueChannelNotificationWorker(q issueChannelNotificationQueries, sender issueChannelNotificationSender) *IssueChannelNotificationWorker {
+type issueChannelNotificationTxStarter interface {
+	Begin(context.Context) (pgx.Tx, error)
+}
+
+func NewIssueChannelNotificationWorker(q issueChannelNotificationQueries, tx issueChannelNotificationTxStarter, sender issueChannelNotificationSender) *IssueChannelNotificationWorker {
 	return &IssueChannelNotificationWorker{
-		queries: q, sender: sender,
+		queries: q, tx: tx, sender: sender,
 		notify: make(chan struct{}, issueChannelNotificationConcurrency),
 		done:   make(chan struct{}),
 	}
@@ -132,26 +137,101 @@ func (w *IssueChannelNotificationWorker) ProcessNext(ctx context.Context) (bool,
 	if err != nil {
 		return false, fmt.Errorf("claim issue channel notification: %w", err)
 	}
-	if _, err := w.queries.AuditClaimedIssueChannelNotificationAttempt(ctx, db.AuditClaimedIssueChannelNotificationAttemptParams{
-		IssueID: row.IssueID, LeaseToken: row.LeaseToken,
+	if w.tx == nil {
+		started, err := w.queries.AuditClaimedIssueChannelNotificationAttempt(ctx, db.AuditClaimedIssueChannelNotificationAttemptParams{
+			IssueID: row.IssueID, WorkspaceID: row.WorkspaceID, LeaseToken: row.LeaseToken,
+		})
+		if err != nil {
+			return true, fmt.Errorf("audit issue channel notification attempt: %w", err)
+		}
+		row = issueChannelNotificationFromAttempt(started)
+		if row.Status == "reconciling" {
+			return w.reconcileClaimed(ctx, w.queries, nil, row)
+		}
+		return w.sendClaimed(ctx, w.queries, nil, row)
+	}
+	tx, err := w.tx.Begin(ctx)
+	if err != nil {
+		return true, fmt.Errorf("begin issue channel notification delivery: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	qtx := db.New(tx)
+	if _, err := qtx.LockWorkspaceForIssueNotification(ctx, row.WorkspaceID); err != nil {
+		return true, fmt.Errorf("lock issue notification workspace: %w", err)
+	}
+	lockedIssue, err := qtx.LockIssueForIssueNotification(ctx, db.LockIssueForIssueNotificationParams{
+		ID: row.IssueID, WorkspaceID: row.WorkspaceID,
+	})
+	if err != nil {
+		return true, fmt.Errorf("lock issue notification issue: %w", err)
+	}
+	if lockedIssue.Status != "in_review" && lockedIssue.Status != "done" {
+		if _, err := qtx.DeferClaimedIssueChannelNotification(ctx, db.DeferClaimedIssueChannelNotificationParams{
+			IssueID: row.IssueID, WorkspaceID: row.WorkspaceID, LeaseToken: row.LeaseToken,
+			AvailableAt: pgtype.Timestamptz{Time: time.Now().Add(issueChannelNotificationPollInterval), Valid: true},
+		}); err != nil {
+			return true, normalizeIssueChannelNotificationLeaseError("defer reopened", row, err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return true, fmt.Errorf("commit reopened issue channel notification defer: %w", err)
+		}
+		return true, nil
+	}
+	if row.ChatSessionID.Valid {
+		if _, err := qtx.LockChatSessionForIssueNotification(ctx, db.LockChatSessionForIssueNotificationParams{
+			ID: row.ChatSessionID, WorkspaceID: row.WorkspaceID,
+		}); err != nil {
+			return true, fmt.Errorf("lock issue notification chat session: %w", err)
+		}
+	}
+	if _, err := qtx.LockChannelInstallationForIssueNotification(ctx, db.LockChannelInstallationForIssueNotificationParams{
+		ID: row.InstallationID, WorkspaceID: row.WorkspaceID, ChannelType: row.ChannelType,
 	}); err != nil {
-		// Do not perform an unaudited Slack operation. Leave the claim leased so
-		// another replica can recover it after expiry and append the attempt first.
+		return true, fmt.Errorf("lock issue notification installation: %w", err)
+	}
+	locked, err := qtx.LockClaimedIssueChannelNotificationForDelivery(ctx, db.LockClaimedIssueChannelNotificationForDeliveryParams{
+		IssueID: row.IssueID, WorkspaceID: row.WorkspaceID, LeaseToken: row.LeaseToken,
+	})
+	if err != nil {
+		return true, normalizeIssueChannelNotificationLeaseError("lock delivery", row, err)
+	}
+	row = locked
+	started, err := qtx.AuditClaimedIssueChannelNotificationAttempt(ctx, db.AuditClaimedIssueChannelNotificationAttemptParams{
+		IssueID: row.IssueID, WorkspaceID: row.WorkspaceID, LeaseToken: row.LeaseToken,
+	})
+	if err != nil {
 		return true, fmt.Errorf("audit issue channel notification attempt: %w", err)
 	}
+	row = issueChannelNotificationFromAttempt(started)
+	var worked bool
 	if row.Status == "reconciling" {
-		return w.reconcileClaimed(ctx, row)
+		worked, err = w.reconcileClaimed(ctx, qtx, tx, row)
+	} else {
+		worked, err = w.sendClaimed(ctx, qtx, tx, row)
 	}
+	if err != nil {
+		return worked, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return true, fmt.Errorf("commit issue channel notification delivery: %w", err)
+	}
+	return worked, nil
+}
 
+func issueChannelNotificationFromAttempt(row db.AuditClaimedIssueChannelNotificationAttemptRow) db.IssueChannelNotification {
+	return db.IssueChannelNotification(row)
+}
+
+func (w *IssueChannelNotificationWorker) sendClaimed(ctx context.Context, q issueChannelNotificationQueries, readDB db.DBTX, row db.IssueChannelNotification) (bool, error) {
 	// Keep every Slack attempt well inside the two-minute database lease. This
 	// prevents a second replica from reclaiming the row while the first call can
 	// still post, which would otherwise reopen a duplicate-send window.
 	deliveryCtx, cancel := context.WithTimeout(ctx, issueChannelNotificationSendTimeout)
-	result, sendErr := w.sender.Send(deliveryCtx, row)
+	result, sendErr := w.sender.Send(deliveryCtx, readDB, row)
 	cancel()
 	if sendErr == nil {
-		_, err = w.queries.DeliverClaimedIssueChannelNotification(ctx, db.DeliverClaimedIssueChannelNotificationParams{
-			IssueID: row.IssueID, LeaseToken: row.LeaseToken,
+		_, err := q.DeliverClaimedIssueChannelNotification(ctx, db.DeliverClaimedIssueChannelNotificationParams{
+			IssueID: row.IssueID, WorkspaceID: row.WorkspaceID, LeaseToken: row.LeaseToken,
 			SlackMessageTs: pgtype.Text{String: result.MessageTS, Valid: result.MessageTS != ""},
 		})
 		return true, normalizeIssueChannelNotificationLeaseError("deliver", row, err)
@@ -170,8 +250,8 @@ func (w *IssueChannelNotificationWorker) ProcessNext(ctx context.Context) (bool,
 	}
 	isClassified := errors.As(sendErr, &classified)
 	if isClassified && classified.Defer() {
-		_, err = w.queries.DeferClaimedIssueChannelNotification(ctx, db.DeferClaimedIssueChannelNotificationParams{
-			IssueID: row.IssueID, LeaseToken: row.LeaseToken,
+		_, err := q.DeferClaimedIssueChannelNotification(ctx, db.DeferClaimedIssueChannelNotificationParams{
+			IssueID: row.IssueID, WorkspaceID: row.WorkspaceID, LeaseToken: row.LeaseToken,
 			AvailableAt: pgtype.Timestamptz{Time: time.Now().Add(issueChannelNotificationPollInterval), Valid: true},
 		})
 		return true, normalizeIssueChannelNotificationLeaseError("defer", row, err)
@@ -182,30 +262,30 @@ func (w *IssueChannelNotificationWorker) ProcessNext(ctx context.Context) (bool,
 	if errors.As(sendErr, &ambiguity) {
 		ambiguous = ambiguity.Ambiguous()
 	}
-	if permanent || (row.Attempts+1 >= issueChannelNotificationMaxAttempts && !ambiguous) {
-		_, err = w.queries.FailClaimedIssueChannelNotification(ctx, db.FailClaimedIssueChannelNotificationParams{
-			IssueID: row.IssueID, LeaseToken: row.LeaseToken,
+	if permanent || (row.Attempts >= issueChannelNotificationMaxAttempts && !ambiguous) {
+		_, err := q.FailClaimedIssueChannelNotification(ctx, db.FailClaimedIssueChannelNotificationParams{
+			IssueID: row.IssueID, WorkspaceID: row.WorkspaceID, LeaseToken: row.LeaseToken,
 			LastError: pgtype.Text{String: sendErr.Error(), Valid: true},
 		})
 		if err == nil {
 			slog.Error("issue channel notification dead-lettered",
 				"issue_id", uuidToString(row.IssueID),
-				"attempts", row.Attempts+1,
+				"attempts", row.Attempts,
 				"error", sendErr,
 			)
 		}
 		return true, normalizeIssueChannelNotificationLeaseError("fail", row, err)
 	}
-	if row.Attempts+1 >= issueChannelNotificationMaxAttempts {
-		_, err = w.queries.ReconcileClaimedIssueChannelNotification(ctx, db.ReconcileClaimedIssueChannelNotificationParams{
-			IssueID: row.IssueID, LeaseToken: row.LeaseToken,
+	if row.Attempts >= issueChannelNotificationMaxAttempts {
+		_, err := q.ReconcileClaimedIssueChannelNotification(ctx, db.ReconcileClaimedIssueChannelNotificationParams{
+			IssueID: row.IssueID, WorkspaceID: row.WorkspaceID, LeaseToken: row.LeaseToken,
 			AvailableAt: pgtype.Timestamptz{Time: time.Now().Add(issueChannelNotificationPollInterval), Valid: true},
 			LastError:   pgtype.Text{String: sendErr.Error(), Valid: true},
 		})
 		return true, normalizeIssueChannelNotificationLeaseError("enter reconciliation", row, err)
 	}
 
-	backoff := time.Second * time.Duration(1<<min(row.Attempts, 6))
+	backoff := time.Second * time.Duration(1<<min(row.Attempts-1, 6))
 	if isClassified && classified.RetryAfter() > 0 {
 		backoff = classified.RetryAfter()
 	} else {
@@ -216,21 +296,21 @@ func (w *IssueChannelNotificationWorker) ProcessNext(ctx context.Context) (bool,
 			backoff += time.Duration(rand.Int64N(int64(jitterCeiling)))
 		}
 	}
-	_, err = w.queries.RetryClaimedIssueChannelNotification(ctx, db.RetryClaimedIssueChannelNotificationParams{
-		IssueID: row.IssueID, LeaseToken: row.LeaseToken,
+	_, err := q.RetryClaimedIssueChannelNotification(ctx, db.RetryClaimedIssueChannelNotificationParams{
+		IssueID: row.IssueID, WorkspaceID: row.WorkspaceID, LeaseToken: row.LeaseToken,
 		AvailableAt: pgtype.Timestamptz{Time: time.Now().Add(backoff), Valid: true},
 		LastError:   pgtype.Text{String: sendErr.Error(), Valid: true},
 	})
 	return true, normalizeIssueChannelNotificationLeaseError("retry", row, err)
 }
 
-func (w *IssueChannelNotificationWorker) reconcileClaimed(ctx context.Context, row db.IssueChannelNotification) (bool, error) {
+func (w *IssueChannelNotificationWorker) reconcileClaimed(ctx context.Context, q issueChannelNotificationQueries, readDB db.DBTX, row db.IssueChannelNotification) (bool, error) {
 	deliveryCtx, cancel := context.WithTimeout(ctx, issueChannelNotificationSendTimeout)
-	result, found, reconcileErr := w.sender.Reconcile(deliveryCtx, row)
+	result, found, reconcileErr := w.sender.Reconcile(deliveryCtx, readDB, row)
 	cancel()
 	if reconcileErr == nil && found {
-		_, err := w.queries.DeliverReconcilingIssueChannelNotification(ctx, db.DeliverReconcilingIssueChannelNotificationParams{
-			IssueID: row.IssueID, LeaseToken: row.LeaseToken,
+		_, err := q.DeliverReconcilingIssueChannelNotification(ctx, db.DeliverReconcilingIssueChannelNotificationParams{
+			IssueID: row.IssueID, WorkspaceID: row.WorkspaceID, LeaseToken: row.LeaseToken,
 			SlackMessageTs: pgtype.Text{String: result.MessageTS, Valid: result.MessageTS != ""},
 		})
 		return true, normalizeIssueChannelNotificationLeaseError("deliver reconciled", row, err)
@@ -239,8 +319,8 @@ func (w *IssueChannelNotificationWorker) reconcileClaimed(ctx context.Context, r
 		return true, ctx.Err()
 	}
 	if reconcileErr == nil {
-		_, err := w.queries.FailReconcilingIssueChannelNotification(ctx, db.FailReconcilingIssueChannelNotificationParams{
-			IssueID: row.IssueID, LeaseToken: row.LeaseToken,
+		_, err := q.FailReconcilingIssueChannelNotification(ctx, db.FailReconcilingIssueChannelNotificationParams{
+			IssueID: row.IssueID, WorkspaceID: row.WorkspaceID, LeaseToken: row.LeaseToken,
 			LastError: pgtype.Text{String: "Slack metadata reconciliation confirmed no delivery", Valid: true},
 		})
 		return true, normalizeIssueChannelNotificationLeaseError("fail reconciled", row, err)
@@ -252,32 +332,32 @@ func (w *IssueChannelNotificationWorker) reconcileClaimed(ctx context.Context, r
 	}
 	isClassified := errors.As(reconcileErr, &classified)
 	if isClassified && classified.Defer() {
-		_, err := w.queries.DeferClaimedIssueChannelNotification(ctx, db.DeferClaimedIssueChannelNotificationParams{
-			IssueID: row.IssueID, LeaseToken: row.LeaseToken,
+		_, err := q.DeferClaimedIssueChannelNotification(ctx, db.DeferClaimedIssueChannelNotificationParams{
+			IssueID: row.IssueID, WorkspaceID: row.WorkspaceID, LeaseToken: row.LeaseToken,
 			AvailableAt: pgtype.Timestamptz{Time: time.Now().Add(issueChannelNotificationPollInterval), Valid: true},
 		})
 		return true, normalizeIssueChannelNotificationLeaseError("defer reconciliation", row, err)
 	}
 	if isClassified && classified.Permanent() {
-		_, err := w.queries.FailReconcilingIssueChannelNotification(ctx, db.FailReconcilingIssueChannelNotificationParams{
-			IssueID: row.IssueID, LeaseToken: row.LeaseToken,
+		_, err := q.FailReconcilingIssueChannelNotification(ctx, db.FailReconcilingIssueChannelNotificationParams{
+			IssueID: row.IssueID, WorkspaceID: row.WorkspaceID, LeaseToken: row.LeaseToken,
 			LastError: pgtype.Text{String: reconcileErr.Error(), Valid: true},
 		})
 		return true, normalizeIssueChannelNotificationLeaseError("fail reconciliation", row, err)
 	}
-	if row.ReconciliationAttempts+1 >= issueChannelNotificationMaxReconciliations {
-		_, err := w.queries.FailReconcilingIssueChannelNotification(ctx, db.FailReconcilingIssueChannelNotificationParams{
-			IssueID: row.IssueID, LeaseToken: row.LeaseToken,
+	if row.ReconciliationAttempts >= issueChannelNotificationMaxReconciliations {
+		_, err := q.FailReconcilingIssueChannelNotification(ctx, db.FailReconcilingIssueChannelNotificationParams{
+			IssueID: row.IssueID, WorkspaceID: row.WorkspaceID, LeaseToken: row.LeaseToken,
 			LastError: pgtype.Text{String: reconcileErr.Error(), Valid: true},
 		})
 		return true, normalizeIssueChannelNotificationLeaseError("fail reconciliation", row, err)
 	}
-	backoff := time.Second * time.Duration(1<<min(row.ReconciliationAttempts, 6))
+	backoff := time.Second * time.Duration(1<<min(row.ReconciliationAttempts-1, 6))
 	if isClassified && classified.RetryAfter() > 0 {
 		backoff = classified.RetryAfter()
 	}
-	_, err := w.queries.RetryReconcilingIssueChannelNotification(ctx, db.RetryReconcilingIssueChannelNotificationParams{
-		IssueID: row.IssueID, LeaseToken: row.LeaseToken,
+	_, err := q.RetryReconcilingIssueChannelNotification(ctx, db.RetryReconcilingIssueChannelNotificationParams{
+		IssueID: row.IssueID, WorkspaceID: row.WorkspaceID, LeaseToken: row.LeaseToken,
 		AvailableAt: pgtype.Timestamptz{Time: time.Now().Add(backoff), Valid: true},
 		LastError:   pgtype.Text{String: reconcileErr.Error(), Valid: true},
 	})
@@ -285,7 +365,7 @@ func (w *IssueChannelNotificationWorker) reconcileClaimed(ctx context.Context, r
 }
 
 func normalizeIssueChannelNotificationLeaseError(operation string, row db.IssueChannelNotification, err error) error {
-	if err == nil || errors.Is(err, pgx.ErrNoRows) {
+	if err == nil {
 		return nil
 	}
 	return fmt.Errorf("%s issue channel notification %s: %w", operation, uuidToString(row.IssueID), err)

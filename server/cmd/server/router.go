@@ -550,6 +550,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			slack.NewOutbound(queries, box.Open, slog.Default()).Register(bus)
 			h.IssueChannelNotificationWorker = handler.NewIssueChannelNotificationWorker(
 				queries,
+				pool,
 				slack.NewIssueNotification(queries, box.Open, appURLFromEnv()),
 			)
 

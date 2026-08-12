@@ -85,6 +85,17 @@ WHERE id = sqlc.arg('id')
   AND workspace_id = sqlc.arg('workspace_id')
   AND channel_type = sqlc.arg('channel_type');
 
+-- name: LockChannelInstallationForIssueNotification :one
+-- Linearize one outbound Slack read/post against revoke and identity changes.
+-- FOR SHARE allows concurrent notifications to the same installation while
+-- blocking DELETE and every config/status UPDATE until the caller releases its
+-- short-lived transaction after the bounded Slack call returns.
+SELECT * FROM channel_installation
+WHERE id = sqlc.arg('id')
+  AND workspace_id = sqlc.arg('workspace_id')
+  AND channel_type = sqlc.arg('channel_type')
+FOR SHARE;
+
 -- name: GetChannelInstallationIdentityForUpdate :one
 -- Installation-scoped bindings are valid only for one external tenant. Slack
 -- app_id identifies the app, while team_id identifies the Slack workspace the
@@ -276,6 +287,7 @@ WITH doomed AS (
     WHERE agent_id IN (
         SELECT id FROM agent WHERE runtime_id = sqlc.arg('runtime_id') AND kind = 'system'
     )
+    FOR UPDATE
 ),
 cleared_issue_notification_audit AS (
     DELETE FROM issue_channel_notification_audit
@@ -590,9 +602,15 @@ WHERE chat_session_id = $1;
 -- the new agent. The chat_session rows are preserved for history; only the
 -- channel binding is removed. The notification row has the same terminal
 -- dependency on this installation and must retire atomically with the binding.
-WITH cleared_chat_sessions AS (
+WITH target_installation AS (
+    SELECT ci.id FROM channel_installation ci
+    WHERE ci.id = sqlc.arg('installation_id')
+      AND ci.channel_type = sqlc.arg('channel_type')
+    FOR UPDATE
+),
+cleared_chat_sessions AS (
     DELETE FROM channel_chat_session_binding
-    WHERE channel_chat_session_binding.installation_id = sqlc.arg('installation_id')
+    WHERE channel_chat_session_binding.installation_id IN (SELECT id FROM target_installation)
       AND channel_chat_session_binding.channel_type = sqlc.arg('channel_type')
     RETURNING chat_session_id
 ),
@@ -605,7 +623,7 @@ cancelled_issue_notifications AS (
     SET status = 'cancelled', cancelled_at = now(),
         last_error = 'Originating channel binding retired',
         lease_token = NULL, lease_expires_at = NULL, updated_at = now()
-    WHERE issue_channel_notification.installation_id = sqlc.arg('installation_id')
+    WHERE issue_channel_notification.installation_id IN (SELECT id FROM target_installation)
       AND status IN ('awaiting', 'queued', 'reconciling')
     RETURNING *
 ),

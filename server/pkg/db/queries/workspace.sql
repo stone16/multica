@@ -79,6 +79,12 @@ RETURNING issue_counter;
 -- workspace, so this cannot deadlock against it.
 SELECT id FROM workspace WHERE id = $1 FOR UPDATE;
 
+-- name: LockWorkspaceForIssueNotification :one
+-- Prevent workspace teardown from crossing an in-flight external delivery.
+-- The worker takes parent locks in workspace -> issue -> chat -> installation
+-- order before it locks the notification row.
+SELECT id FROM workspace WHERE id = $1 FOR KEY SHARE;
+
 -- name: LockWorkspaceForChatSessionCreate :one
 -- The creator half of the workspace delete/create protocol (#5219). Every
 -- production path that inserts a chat_session takes this FOR KEY SHARE lock on the

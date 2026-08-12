@@ -332,6 +332,12 @@ SELECT id FROM chat_session
 WHERE id = $1
 FOR UPDATE;
 
+-- name: LockChatSessionForIssueNotification :one
+-- Linearize chat archive/delete with a bounded outbound notification delivery.
+SELECT id FROM chat_session
+WHERE id = $1 AND workspace_id = $2
+FOR SHARE;
+
 -- name: LockChatSessionForRuntimeBind :one
 -- Acquires an exclusive (FOR UPDATE) row lock on chat_session(id), serialising
 -- "which runtime does this session execute on" against "enqueue the next task".

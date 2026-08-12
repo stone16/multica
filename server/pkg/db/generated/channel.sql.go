@@ -274,7 +274,7 @@ cancelled_issue_notifications AS (
         lease_token = NULL, lease_expires_at = NULL, updated_at = now()
     WHERE installation_id IN (SELECT id FROM target)
       AND status IN ('awaiting', 'queued', 'reconciling')
-    RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
+    RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, claim_count, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
 ),
 audited_issue_notification_cancellations AS (
     INSERT INTO issue_channel_notification_audit (
@@ -637,9 +637,15 @@ func (q *Queries) DeleteChannelChatSessionBindingBySession(ctx context.Context, 
 }
 
 const deleteChannelChatSessionBindingsByInstallation = `-- name: DeleteChannelChatSessionBindingsByInstallation :exec
-WITH cleared_chat_sessions AS (
+WITH target_installation AS (
+    SELECT ci.id FROM channel_installation ci
+    WHERE ci.id = $1
+      AND ci.channel_type = $2
+    FOR UPDATE
+),
+cleared_chat_sessions AS (
     DELETE FROM channel_chat_session_binding
-    WHERE channel_chat_session_binding.installation_id = $1
+    WHERE channel_chat_session_binding.installation_id IN (SELECT id FROM target_installation)
       AND channel_chat_session_binding.channel_type = $2
     RETURNING chat_session_id
 ),
@@ -652,9 +658,9 @@ cancelled_issue_notifications AS (
     SET status = 'cancelled', cancelled_at = now(),
         last_error = 'Originating channel binding retired',
         lease_token = NULL, lease_expires_at = NULL, updated_at = now()
-    WHERE issue_channel_notification.installation_id = $1
+    WHERE issue_channel_notification.installation_id IN (SELECT id FROM target_installation)
       AND status IN ('awaiting', 'queued', 'reconciling')
-    RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
+    RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, claim_count, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
 ),
 audited_issue_notification_cancellations AS (
     INSERT INTO issue_channel_notification_audit (
@@ -692,6 +698,7 @@ WITH doomed AS (
     WHERE agent_id IN (
         SELECT id FROM agent WHERE runtime_id = $1 AND kind = 'system'
     )
+    FOR UPDATE
 ),
 cleared_issue_notification_audit AS (
     DELETE FROM issue_channel_notification_audit
@@ -1597,6 +1604,44 @@ type LockChannelInstallationAppIDSlotParams struct {
 func (q *Queries) LockChannelInstallationAppIDSlot(ctx context.Context, arg LockChannelInstallationAppIDSlotParams) error {
 	_, err := q.db.Exec(ctx, lockChannelInstallationAppIDSlot, arg.ChannelType, arg.AppID)
 	return err
+}
+
+const lockChannelInstallationForIssueNotification = `-- name: LockChannelInstallationForIssueNotification :one
+SELECT id, workspace_id, agent_id, channel_type, config, status, ws_lease_token, ws_lease_expires_at, installer_user_id, installed_at, created_at, updated_at FROM channel_installation
+WHERE id = $1
+  AND workspace_id = $2
+  AND channel_type = $3
+FOR SHARE
+`
+
+type LockChannelInstallationForIssueNotificationParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	ChannelType string      `json:"channel_type"`
+}
+
+// Linearize one outbound Slack read/post against revoke and identity changes.
+// FOR SHARE allows concurrent notifications to the same installation while
+// blocking DELETE and every config/status UPDATE until the caller releases its
+// short-lived transaction after the bounded Slack call returns.
+func (q *Queries) LockChannelInstallationForIssueNotification(ctx context.Context, arg LockChannelInstallationForIssueNotificationParams) (ChannelInstallation, error) {
+	row := q.db.QueryRow(ctx, lockChannelInstallationForIssueNotification, arg.ID, arg.WorkspaceID, arg.ChannelType)
+	var i ChannelInstallation
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.AgentID,
+		&i.ChannelType,
+		&i.Config,
+		&i.Status,
+		&i.WsLeaseToken,
+		&i.WsLeaseExpiresAt,
+		&i.InstallerUserID,
+		&i.InstalledAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const markChannelChatSessionPendingFresh = `-- name: MarkChannelChatSessionPendingFresh :one

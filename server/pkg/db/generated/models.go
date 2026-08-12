@@ -670,6 +670,7 @@ type IssueChannelNotification struct {
 	AvailableAt            pgtype.Timestamptz `json:"available_at"`
 	LeaseToken             pgtype.UUID        `json:"lease_token"`
 	LeaseExpiresAt         pgtype.Timestamptz `json:"lease_expires_at"`
+	ClaimCount             int32              `json:"claim_count"`
 	Attempts               int32              `json:"attempts"`
 	ReconciliationAttempts int32              `json:"reconciliation_attempts"`
 	LastError              pgtype.Text        `json:"last_error"`

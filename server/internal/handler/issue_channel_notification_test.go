@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 
@@ -17,6 +21,22 @@ import (
 	channelslack "github.com/multica-ai/multica/server/internal/integrations/slack"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
+
+type gatedIssueChannelNotificationTxStarter struct {
+	inner   issueChannelNotificationTxStarter
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s gatedIssueChannelNotificationTxStarter) Begin(ctx context.Context) (pgx.Tx, error) {
+	close(s.started)
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return s.inner.Begin(ctx)
+}
 
 // TestIssueChannelNotification_QueuesSlackOriginOnce exercises the public issue
 // create/update boundary. A Slack chat task is server-trusted provenance; the
@@ -286,6 +306,8 @@ func TestIssueChannelNotification_QueuesSlackOriginOnce(t *testing.T) {
 	assertNotification("queued", 1)
 	var slackMu sync.Mutex
 	var slackPost url.Values
+	postStarted := make(chan struct{})
+	releasePost := make(chan struct{})
 	slackAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -296,6 +318,8 @@ func TestIssueChannelNotification_QueuesSlackOriginOnce(t *testing.T) {
 		case "/conversations.replies":
 			_, _ = w.Write([]byte(`{"ok":true,"messages":[],"has_more":false}`))
 		case "/chat.postMessage":
+			close(postStarted)
+			<-releasePost
 			slackMu.Lock()
 			slackPost = r.PostForm
 			slackMu.Unlock()
@@ -311,7 +335,7 @@ func TestIssueChannelNotification_QueuesSlackOriginOnce(t *testing.T) {
 		"https://app.multica.test",
 		channelslack.WithIssueNotificationAPIURL(slackAPI.URL),
 	)
-	worker := NewIssueChannelNotificationWorker(testHandler.Queries, sender)
+	worker := NewIssueChannelNotificationWorker(testHandler.Queries, testPool, sender)
 	updateStatus("todo")
 	worked, err := worker.ProcessNext(ctx)
 	if err != nil || worked {
@@ -319,9 +343,86 @@ func TestIssueChannelNotification_QueuesSlackOriginOnce(t *testing.T) {
 	}
 	assertNotification("queued", 1)
 	updateStatus("in_review")
-	worked, err = worker.ProcessNext(ctx)
+	type processResult struct {
+		worked bool
+		err    error
+	}
+	claimStarted := make(chan struct{})
+	allowDeliveryTx := make(chan struct{})
+	reopenRaceWorker := NewIssueChannelNotificationWorker(testHandler.Queries, gatedIssueChannelNotificationTxStarter{
+		inner: testPool, started: claimStarted, release: allowDeliveryTx,
+	}, sender)
+	processDone := make(chan processResult, 1)
+	go func() {
+		worked, err := reopenRaceWorker.ProcessNext(ctx)
+		processDone <- processResult{worked: worked, err: err}
+	}()
+	select {
+	case <-claimStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("notification claim did not reach delivery transaction gate")
+	}
+	updateStatus("todo")
+	close(allowDeliveryTx)
+	result := <-processDone
+	if result.err != nil || !result.worked {
+		t.Fatalf("ProcessNext across reopen race = (%v, %v), want deferred work", result.worked, result.err)
+	}
+	assertNotification("queued", 1)
+	assertAttempts(0)
+	var deliveryAttemptAuditCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*) FROM issue_channel_notification_audit
+		WHERE issue_id = $1 AND event_type = 'delivery_attempt'
+	`, created.ID).Scan(&deliveryAttemptAuditCount); err != nil {
+		t.Fatalf("count reopen-race delivery attempts: %v", err)
+	}
+	if deliveryAttemptAuditCount != 0 {
+		t.Fatalf("reopen race wrote %d delivery attempts, want 0", deliveryAttemptAuditCount)
+	}
+	updateStatus("in_review")
+	processDone = make(chan processResult, 1)
+	go func() {
+		worked, err := worker.ProcessNext(ctx)
+		processDone <- processResult{worked: worked, err: err}
+	}()
+	select {
+	case <-postStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Slack POST did not start")
+	}
+	updateConn, err := testPool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire concurrent installation update connection: %v", err)
+	}
+	defer updateConn.Release()
+	if _, err := updateConn.Exec(ctx, `SET lock_timeout = '150ms'`); err != nil {
+		t.Fatalf("set concurrent installation update lock timeout: %v", err)
+	}
+	_, updateErr := updateConn.Exec(ctx, `
+			UPDATE channel_installation
+			SET config = config || '{"operator_probe": true}'::jsonb
+			WHERE id = $1
+		`, installationID)
+	close(releasePost)
+	var lockErr *pgconn.PgError
+	if !errors.As(updateErr, &lockErr) || lockErr.Code != "55P03" {
+		t.Fatalf("installation update during Slack POST = %v, want PostgreSQL lock timeout", updateErr)
+	}
+	result = <-processDone
+	worked, err = result.worked, result.err
 	if err != nil || !worked {
 		t.Fatalf("ProcessNext = (%v, %v), want delivered work", worked, err)
+	}
+	if _, err := updateConn.Exec(ctx, `SET lock_timeout = 0`); err != nil {
+		t.Fatalf("reset concurrent installation update lock timeout: %v", err)
+	}
+	if _, err := updateConn.Exec(ctx, `
+		UPDATE channel_installation
+		SET config = config || '{"operator_probe": true}'::jsonb
+		WHERE id = $1
+	`, installationID); err != nil {
+		t.Fatalf("update Slack installation after delivery fence: %v", err)
 	}
 	slackMu.Lock()
 	posted := slackPost
@@ -566,7 +667,7 @@ func TestIssueChannelNotification_SlackSlashCommandPostsChannelCallback(t *testi
 		"https://app.multica.test",
 		channelslack.WithIssueNotificationAPIURL(slackAPI.URL),
 	)
-	worker := NewIssueChannelNotificationWorker(testHandler.Queries, sender)
+	worker := NewIssueChannelNotificationWorker(testHandler.Queries, testPool, sender)
 	worked, err := worker.ProcessNext(ctx)
 	if err != nil || !worked {
 		t.Fatalf("ProcessNext(slash) = (%v, %v), want delivered work", worked, err)
@@ -586,14 +687,70 @@ func TestIssueChannelNotification_SlackSlashCommandPostsChannelCallback(t *testi
 	if notificationStatus != "delivered" {
 		t.Fatalf("slash notification status = %q, want delivered", notificationStatus)
 	}
-	var attachedAuditCount int
-	if err := testPool.QueryRow(ctx, `
-		SELECT count(*) FROM issue_channel_notification_audit
-		WHERE issue_id = $1 AND created_by_task_id = $2
-	`, created.ID, taskID).Scan(&attachedAuditCount); err != nil {
+	type auditEvent struct {
+		eventType     string
+		phase         *string
+		attemptNumber *int
+		messageTS     *string
+		issueID       *string
+	}
+	var auditEvents []auditEvent
+	rows, err := testPool.Query(ctx, `
+		SELECT event_type, phase, attempt_number, slack_message_ts, issue_id::text
+		FROM issue_channel_notification_audit
+		WHERE created_by_task_id = $1
+		ORDER BY created_at, id
+	`, taskID)
+	if err != nil {
 		t.Fatalf("load attached slash notification audit: %v", err)
 	}
-	if attachedAuditCount != 4 {
-		t.Fatalf("attached slash notification audit rows = %d, want target/queue/attempt/delivery", attachedAuditCount)
+	for rows.Next() {
+		var event auditEvent
+		if err := rows.Scan(&event.eventType, &event.phase, &event.attemptNumber, &event.messageTS, &event.issueID); err != nil {
+			rows.Close()
+			t.Fatalf("scan attached slash notification audit: %v", err)
+		}
+		auditEvents = append(auditEvents, event)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		t.Fatalf("iterate attached slash notification audit: %v", err)
+	}
+	rows.Close()
+	if len(auditEvents) != 5 {
+		t.Fatalf("attached slash notification audit = %#v, want five exact lifecycle events", auditEvents)
+	}
+	wantTypes := []string{"target_created", "target_attached", "queued", "delivery_attempt", "delivered"}
+	for i, want := range wantTypes {
+		if auditEvents[i].eventType != want {
+			t.Fatalf("attached slash notification audit types = %#v, want %v", auditEvents, wantTypes)
+		}
+	}
+	if auditEvents[0].issueID != nil || auditEvents[1].issueID == nil || *auditEvents[1].issueID != created.ID {
+		t.Fatalf("slash target audit attachment = %#v, want immutable create then attached issue", auditEvents[:2])
+	}
+	if auditEvents[3].phase == nil || *auditEvents[3].phase != "send" ||
+		auditEvents[3].attemptNumber == nil || *auditEvents[3].attemptNumber != 1 {
+		t.Fatalf("slash delivery attempt audit = %#v, want send attempt 1", auditEvents[3])
+	}
+	if auditEvents[4].messageTS == nil || *auditEvents[4].messageTS != "1700000001.999999" {
+		t.Fatalf("slash delivered audit = %#v, want Slack message timestamp", auditEvents[4])
+	}
+
+	deleteIssue := httptest.NewRecorder()
+	deleteRequest := withURLParam(newRequest("DELETE", "/api/issues/"+created.ID, nil), "id", created.ID)
+	testHandler.DeleteIssue(deleteIssue, deleteRequest)
+	if deleteIssue.Code != http.StatusNoContent {
+		t.Fatalf("DeleteIssue(slash): expected 204, got %d: %s", deleteIssue.Code, deleteIssue.Body.String())
+	}
+	var survivingAudit int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*) FROM issue_channel_notification_audit
+		WHERE created_by_task_id = $1
+	`, taskID).Scan(&survivingAudit); err != nil {
+		t.Fatalf("count slash audit after issue delete: %v", err)
+	}
+	if survivingAudit != 0 {
+		t.Fatalf("slash audit rows after issue delete = %d, want 0 including original NULL-issue event", survivingAudit)
 	}
 }

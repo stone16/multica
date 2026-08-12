@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	channelslack "github.com/multica-ai/multica/server/internal/integrations/slack"
@@ -27,11 +28,29 @@ type fakeIssueChannelNotificationQueries struct {
 }
 
 func (f *fakeIssueChannelNotificationQueries) ClaimQueuedIssueChannelNotification(context.Context) (db.IssueChannelNotification, error) {
+	f.row.ClaimCount++
 	return f.row, nil
 }
-func (f *fakeIssueChannelNotificationQueries) AuditClaimedIssueChannelNotificationAttempt(_ context.Context, p db.AuditClaimedIssueChannelNotificationAttemptParams) (pgtype.UUID, error) {
+func (f *fakeIssueChannelNotificationQueries) AuditClaimedIssueChannelNotificationAttempt(_ context.Context, p db.AuditClaimedIssueChannelNotificationAttemptParams) (db.AuditClaimedIssueChannelNotificationAttemptRow, error) {
 	f.audited = p
-	return pgtype.UUID{Bytes: [16]byte{9}, Valid: true}, f.auditErr
+	if f.auditErr != nil {
+		return db.AuditClaimedIssueChannelNotificationAttemptRow{}, f.auditErr
+	}
+	if f.row.Status == "reconciling" {
+		f.row.ReconciliationAttempts++
+	} else {
+		f.row.Attempts++
+	}
+	return db.AuditClaimedIssueChannelNotificationAttemptRow{
+		IssueID: f.row.IssueID, WorkspaceID: f.row.WorkspaceID, CreatedByTaskID: f.row.CreatedByTaskID,
+		InitiatorUserID: f.row.InitiatorUserID, ChatSessionID: f.row.ChatSessionID, InstallationID: f.row.InstallationID,
+		ChannelType: f.row.ChannelType, ChannelAppID: f.row.ChannelAppID, ChannelTeamID: f.row.ChannelTeamID,
+		ChannelID: f.row.ChannelID, ThreadTs: f.row.ThreadTs, Status: f.row.Status, AvailableAt: f.row.AvailableAt,
+		LeaseToken: f.row.LeaseToken, LeaseExpiresAt: f.row.LeaseExpiresAt, ClaimCount: f.row.ClaimCount, Attempts: f.row.Attempts,
+		ReconciliationAttempts: f.row.ReconciliationAttempts, LastError: f.row.LastError,
+		SlackMessageTs: f.row.SlackMessageTs, DeliveredAt: f.row.DeliveredAt, FailedAt: f.row.FailedAt,
+		CreatedAt: f.row.CreatedAt, QueuedAt: f.row.QueuedAt, CancelledAt: f.row.CancelledAt, UpdatedAt: f.row.UpdatedAt,
+	}, nil
 }
 func (f *fakeIssueChannelNotificationQueries) DeferClaimedIssueChannelNotification(_ context.Context, p db.DeferClaimedIssueChannelNotificationParams) (db.IssueChannelNotification, error) {
 	f.deferred = p
@@ -68,10 +87,10 @@ func (f *fakeIssueChannelNotificationQueries) FailReconcilingIssueChannelNotific
 
 type errorIssueChannelNotificationSender struct{ err error }
 
-func (s errorIssueChannelNotificationSender) Send(context.Context, db.IssueChannelNotification) (channelslack.IssueNotificationResult, error) {
+func (s errorIssueChannelNotificationSender) Send(context.Context, db.DBTX, db.IssueChannelNotification) (channelslack.IssueNotificationResult, error) {
 	return channelslack.IssueNotificationResult{}, s.err
 }
-func (s errorIssueChannelNotificationSender) Reconcile(context.Context, db.IssueChannelNotification) (channelslack.IssueNotificationResult, bool, error) {
+func (s errorIssueChannelNotificationSender) Reconcile(context.Context, db.DBTX, db.IssueChannelNotification) (channelslack.IssueNotificationResult, bool, error) {
 	return channelslack.IssueNotificationResult{}, false, s.err
 }
 
@@ -82,12 +101,12 @@ type reconcileIssueChannelNotificationSender struct {
 	sends  int
 }
 
-func (s *reconcileIssueChannelNotificationSender) Send(context.Context, db.IssueChannelNotification) (channelslack.IssueNotificationResult, error) {
+func (s *reconcileIssueChannelNotificationSender) Send(context.Context, db.DBTX, db.IssueChannelNotification) (channelslack.IssueNotificationResult, error) {
 	s.sends++
 	return channelslack.IssueNotificationResult{}, errors.New("reconciling rows must not POST")
 }
 
-func (s *reconcileIssueChannelNotificationSender) Reconcile(context.Context, db.IssueChannelNotification) (channelslack.IssueNotificationResult, bool, error) {
+func (s *reconcileIssueChannelNotificationSender) Reconcile(context.Context, db.DBTX, db.IssueChannelNotification) (channelslack.IssueNotificationResult, bool, error) {
 	return s.result, s.found, s.err
 }
 
@@ -96,11 +115,17 @@ type deadlineIssueChannelNotificationSender struct {
 	ok       bool
 }
 
-func (s *deadlineIssueChannelNotificationSender) Send(ctx context.Context, _ db.IssueChannelNotification) (channelslack.IssueNotificationResult, error) {
+type errorIssueChannelNotificationTxStarter struct{ err error }
+
+func (s errorIssueChannelNotificationTxStarter) Begin(context.Context) (pgx.Tx, error) {
+	return nil, s.err
+}
+
+func (s *deadlineIssueChannelNotificationSender) Send(ctx context.Context, _ db.DBTX, _ db.IssueChannelNotification) (channelslack.IssueNotificationResult, error) {
 	s.deadline, s.ok = ctx.Deadline()
 	return channelslack.IssueNotificationResult{}, context.DeadlineExceeded
 }
-func (s *deadlineIssueChannelNotificationSender) Reconcile(ctx context.Context, _ db.IssueChannelNotification) (channelslack.IssueNotificationResult, bool, error) {
+func (s *deadlineIssueChannelNotificationSender) Reconcile(ctx context.Context, _ db.DBTX, _ db.IssueChannelNotification) (channelslack.IssueNotificationResult, bool, error) {
 	s.deadline, s.ok = ctx.Deadline()
 	return channelslack.IssueNotificationResult{}, false, context.DeadlineExceeded
 }
@@ -121,7 +146,7 @@ func (e classifiedWorkerError) Ambiguous() bool           { return e.ambiguous }
 func TestIssueChannelNotificationWorker_HonorsRetryAfter(t *testing.T) {
 	queries := &fakeIssueChannelNotificationQueries{row: workerTestIssueChannelNotification()}
 	started := time.Now()
-	worker := NewIssueChannelNotificationWorker(queries, errorIssueChannelNotificationSender{
+	worker := NewIssueChannelNotificationWorker(queries, nil, errorIssueChannelNotificationSender{
 		err: classifiedWorkerError{retry: 17 * time.Second},
 	})
 	worked, err := worker.ProcessNext(context.Background())
@@ -141,7 +166,7 @@ func TestIssueChannelNotificationWorker_RefusesUnauditedDelivery(t *testing.T) {
 		row: workerTestIssueChannelNotification(), auditErr: errors.New("audit unavailable"),
 	}
 	sender := &reconcileIssueChannelNotificationSender{}
-	worker := NewIssueChannelNotificationWorker(queries, sender)
+	worker := NewIssueChannelNotificationWorker(queries, nil, sender)
 
 	worked, err := worker.ProcessNext(context.Background())
 	if !worked || err == nil {
@@ -150,13 +175,34 @@ func TestIssueChannelNotificationWorker_RefusesUnauditedDelivery(t *testing.T) {
 	if sender.sends != 0 || queries.retried.IssueID.Valid || queries.failed.IssueID.Valid {
 		t.Fatal("unaudited attempt reached transport or mutated delivery state")
 	}
+	if queries.row.Attempts != 0 {
+		t.Fatalf("audit failure consumed %d attempts, want 0", queries.row.Attempts)
+	}
+}
+
+func TestIssueChannelNotificationWorker_PreTransportFailureDoesNotConsumeDeliveryAttempt(t *testing.T) {
+	queries := &fakeIssueChannelNotificationQueries{row: workerTestIssueChannelNotification()}
+	worker := NewIssueChannelNotificationWorker(queries, errorIssueChannelNotificationTxStarter{
+		err: errors.New("database unavailable"),
+	}, errorIssueChannelNotificationSender{})
+
+	worked, err := worker.ProcessNext(context.Background())
+	if !worked || err == nil {
+		t.Fatalf("ProcessNext = (%v, %v), want claimed pre-transport failure", worked, err)
+	}
+	if queries.row.Attempts != 0 || queries.audited.IssueID.Valid {
+		t.Fatalf("pre-transport failure = attempts %d audit %#v, want neither", queries.row.Attempts, queries.audited)
+	}
+	if queries.row.ClaimCount != 1 {
+		t.Fatalf("pre-transport claim count = %d, want durable replay marker 1", queries.row.ClaimCount)
+	}
 }
 
 func TestIssueChannelNotificationWorker_BoundsSlackAttemptAndRetriesTimeout(t *testing.T) {
 	queries := &fakeIssueChannelNotificationQueries{row: workerTestIssueChannelNotification()}
 	sender := &deadlineIssueChannelNotificationSender{}
 	started := time.Now()
-	worker := NewIssueChannelNotificationWorker(queries, sender)
+	worker := NewIssueChannelNotificationWorker(queries, nil, sender)
 
 	worked, err := worker.ProcessNext(context.Background())
 	if err != nil || !worked {
@@ -178,7 +224,7 @@ func TestIssueChannelNotificationWorker_BoundsSlackAttemptAndRetriesTimeout(t *t
 
 func TestIssueChannelNotificationWorker_PermanentErrorDeadLetters(t *testing.T) {
 	queries := &fakeIssueChannelNotificationQueries{row: workerTestIssueChannelNotification()}
-	worker := NewIssueChannelNotificationWorker(queries, errorIssueChannelNotificationSender{
+	worker := NewIssueChannelNotificationWorker(queries, nil, errorIssueChannelNotificationSender{
 		err: classifiedWorkerError{permanent: true},
 	})
 	worked, err := worker.ProcessNext(context.Background())
@@ -194,7 +240,7 @@ func TestIssueChannelNotificationWorker_FinalAmbiguousSendEntersReadOnlyReconcil
 	row := workerTestIssueChannelNotification()
 	row.Attempts = issueChannelNotificationMaxAttempts - 1
 	queries := &fakeIssueChannelNotificationQueries{row: row}
-	worker := NewIssueChannelNotificationWorker(queries, errorIssueChannelNotificationSender{
+	worker := NewIssueChannelNotificationWorker(queries, nil, errorIssueChannelNotificationSender{
 		err: classifiedWorkerError{ambiguous: true},
 	})
 
@@ -214,7 +260,7 @@ func TestIssueChannelNotificationWorker_FinalDefiniteFailureDoesNotEnterReconcil
 	row := workerTestIssueChannelNotification()
 	row.Attempts = issueChannelNotificationMaxAttempts - 1
 	queries := &fakeIssueChannelNotificationQueries{row: row}
-	worker := NewIssueChannelNotificationWorker(queries, errorIssueChannelNotificationSender{
+	worker := NewIssueChannelNotificationWorker(queries, nil, errorIssueChannelNotificationSender{
 		err: classifiedWorkerError{},
 	})
 
@@ -235,7 +281,7 @@ func TestIssueChannelNotificationWorker_ReconciliationFindsAmbiguousSuccessWitho
 		found:  true,
 	}
 	queries := &fakeIssueChannelNotificationQueries{row: row}
-	worker := NewIssueChannelNotificationWorker(queries, sender)
+	worker := NewIssueChannelNotificationWorker(queries, nil, sender)
 
 	worked, err := worker.ProcessNext(context.Background())
 	if err != nil || !worked {
@@ -253,7 +299,7 @@ func TestIssueChannelNotificationWorker_ReconciliationConfirmsAbsenceAndFails(t 
 	row := workerTestIssueChannelNotification()
 	row.Status = "reconciling"
 	queries := &fakeIssueChannelNotificationQueries{row: row}
-	worker := NewIssueChannelNotificationWorker(queries, &reconcileIssueChannelNotificationSender{})
+	worker := NewIssueChannelNotificationWorker(queries, nil, &reconcileIssueChannelNotificationSender{})
 
 	worked, err := worker.ProcessNext(context.Background())
 	if err != nil || !worked {
@@ -269,7 +315,7 @@ func TestIssueChannelNotificationWorker_ReconciliationQueryFailureRetriesWithout
 	row.Status = "reconciling"
 	sender := &reconcileIssueChannelNotificationSender{err: errors.New("Slack read unavailable")}
 	queries := &fakeIssueChannelNotificationQueries{row: row}
-	worker := NewIssueChannelNotificationWorker(queries, sender)
+	worker := NewIssueChannelNotificationWorker(queries, nil, sender)
 
 	worked, err := worker.ProcessNext(context.Background())
 	if err != nil || !worked {
@@ -280,9 +326,44 @@ func TestIssueChannelNotificationWorker_ReconciliationQueryFailureRetriesWithout
 	}
 }
 
+func TestIssueChannelNotificationWorker_ReconciliationPermanentErrorDeadLetters(t *testing.T) {
+	row := workerTestIssueChannelNotification()
+	row.Status = "reconciling"
+	queries := &fakeIssueChannelNotificationQueries{row: row}
+	worker := NewIssueChannelNotificationWorker(queries, nil, &reconcileIssueChannelNotificationSender{
+		err: classifiedWorkerError{permanent: true},
+	})
+
+	worked, err := worker.ProcessNext(context.Background())
+	if err != nil || !worked {
+		t.Fatalf("ProcessNext = (%v, %v), want permanent reconciliation failure", worked, err)
+	}
+	if !queries.failedReconcile.IssueID.Valid || queries.retryReconcile.IssueID.Valid {
+		t.Fatal("permanent reconciliation error was not dead-lettered")
+	}
+}
+
+func TestIssueChannelNotificationWorker_ReconciliationAttemptLimitDeadLetters(t *testing.T) {
+	row := workerTestIssueChannelNotification()
+	row.Status = "reconciling"
+	row.ReconciliationAttempts = issueChannelNotificationMaxReconciliations - 1
+	queries := &fakeIssueChannelNotificationQueries{row: row}
+	worker := NewIssueChannelNotificationWorker(queries, nil, &reconcileIssueChannelNotificationSender{
+		err: errors.New("Slack read unavailable"),
+	})
+
+	worked, err := worker.ProcessNext(context.Background())
+	if err != nil || !worked {
+		t.Fatalf("ProcessNext = (%v, %v), want reconciliation attempt-limit failure", worked, err)
+	}
+	if !queries.failedReconcile.IssueID.Valid || queries.retryReconcile.IssueID.Valid {
+		t.Fatal("final reconciliation error did not dead-letter at the attempt limit")
+	}
+}
+
 func TestIssueChannelNotificationWorker_CanceledContextLeavesLeaseForRecovery(t *testing.T) {
 	queries := &fakeIssueChannelNotificationQueries{row: workerTestIssueChannelNotification()}
-	worker := NewIssueChannelNotificationWorker(queries, errorIssueChannelNotificationSender{
+	worker := NewIssueChannelNotificationWorker(queries, nil, errorIssueChannelNotificationSender{
 		err: context.Canceled,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -297,29 +378,40 @@ func TestIssueChannelNotificationWorker_CanceledContextLeavesLeaseForRecovery(t 
 	}
 }
 
-func TestIssueChannelNotificationWorker_ReopenRaceDefersWithoutAttempt(t *testing.T) {
+func TestIssueChannelNotificationWorker_PostAuditReopenDefersRecordedAttempt(t *testing.T) {
 	queries := &fakeIssueChannelNotificationQueries{row: workerTestIssueChannelNotification()}
-	worker := NewIssueChannelNotificationWorker(queries, errorIssueChannelNotificationSender{
+	worker := NewIssueChannelNotificationWorker(queries, nil, errorIssueChannelNotificationSender{
 		err: classifiedWorkerError{deferSend: true},
 	})
 
 	worked, err := worker.ProcessNext(context.Background())
 	if err != nil || !worked {
-		t.Fatalf("ProcessNext = (%v, %v), want deferred claimed work", worked, err)
+		t.Fatalf("ProcessNext = (%v, %v), want deferred post-audit work", worked, err)
 	}
 	if !queries.deferred.IssueID.Valid {
-		t.Fatal("reopen race did not release the claim through defer")
+		t.Fatal("post-audit reopen did not release the claim through defer")
 	}
 	if queries.retried.IssueID.Valid || queries.failed.IssueID.Valid || queries.delivered.IssueID.Valid {
-		t.Fatal("reopen race consumed an attempt or reached a terminal state")
+		t.Fatal("post-audit reopen reached retry or terminal state")
+	}
+	if queries.row.Attempts != 1 {
+		t.Fatalf("post-audit status defer attempts = %d, want recorded transport attempt 1", queries.row.Attempts)
+	}
+}
+
+func TestIssueChannelNotificationWorker_LostTerminalOwnershipIsObservable(t *testing.T) {
+	err := normalizeIssueChannelNotificationLeaseError("deliver", workerTestIssueChannelNotification(), pgx.ErrNoRows)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("lost terminal ownership error = %v, want pgx.ErrNoRows", err)
 	}
 }
 
 func workerTestIssueChannelNotification() db.IssueChannelNotification {
 	return db.IssueChannelNotification{
-		IssueID:    pgtype.UUID{Bytes: [16]byte{1}, Valid: true},
-		LeaseToken: pgtype.UUID{Bytes: [16]byte{2}, Valid: true},
-		Status:     "queued",
+		IssueID:     pgtype.UUID{Bytes: [16]byte{1}, Valid: true},
+		WorkspaceID: pgtype.UUID{Bytes: [16]byte{3}, Valid: true},
+		LeaseToken:  pgtype.UUID{Bytes: [16]byte{2}, Valid: true},
+		Status:      "queued",
 	}
 }
 

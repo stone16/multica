@@ -32,15 +32,16 @@ WITH RECURSIVE task_lineage AS (
       AND n.created_by_task_id = root.id
       AND n.workspace_id = $4::uuid
       AND n.issue_id IS NULL
-    RETURNING n.issue_id, n.workspace_id, n.created_by_task_id, n.initiator_user_id, n.chat_session_id, n.installation_id, n.channel_type, n.channel_app_id, n.channel_team_id, n.channel_id, n.thread_ts, n.status, n.available_at, n.lease_token, n.lease_expires_at, n.attempts, n.reconciliation_attempts, n.last_error, n.slack_message_ts, n.delivered_at, n.failed_at, n.created_at, n.queued_at, n.cancelled_at, n.updated_at
+    RETURNING n.issue_id, n.workspace_id, n.created_by_task_id, n.initiator_user_id, n.chat_session_id, n.installation_id, n.channel_type, n.channel_app_id, n.channel_team_id, n.channel_id, n.thread_ts, n.status, n.available_at, n.lease_token, n.lease_expires_at, n.claim_count, n.attempts, n.reconciliation_attempts, n.last_error, n.slack_message_ts, n.delivered_at, n.failed_at, n.created_at, n.queued_at, n.cancelled_at, n.updated_at
 ), attached_slash_audit AS (
-    UPDATE issue_channel_notification_audit audit
-    SET issue_id = attached.issue_id
-    FROM attached_slash attached
-    WHERE audit.workspace_id = attached.workspace_id
-      AND audit.created_by_task_id = attached.created_by_task_id
-      AND audit.issue_id IS NULL
-    RETURNING audit.id
+    INSERT INTO issue_channel_notification_audit (
+        issue_id, workspace_id, created_by_task_id, installation_id,
+        event_type, details
+    )
+    SELECT issue_id, workspace_id, created_by_task_id, installation_id,
+           'target_attached', jsonb_build_object('delivery_scope', 'channel')
+    FROM attached_slash
+    RETURNING id
 ), origin_message AS (
     SELECT root.id AS created_by_task_id,
            COALESCE(root.initiator_user_id, root.originator_user_id) AS initiator_user_id,
@@ -107,11 +108,11 @@ WITH RECURSIVE task_lineage AS (
     FROM trusted_target
     WHERE channel_id <> '' AND thread_ts <> ''
     ON CONFLICT DO NOTHING
-    RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
+    RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, claim_count, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
 ), attached AS (
-    SELECT issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at FROM attached_slash
+    SELECT issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, claim_count, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at FROM attached_slash
     UNION ALL
-    SELECT issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at FROM inserted
+    SELECT issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, claim_count, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at FROM inserted
 ), audited AS (
     INSERT INTO issue_channel_notification_audit (
         issue_id, workspace_id, created_by_task_id, installation_id,
@@ -121,7 +122,7 @@ WITH RECURSIVE task_lineage AS (
            'target_created', jsonb_build_object('delivery_scope', 'thread')
     FROM inserted
 )
-SELECT issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at FROM attached
+SELECT issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, claim_count, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at FROM attached
 `
 
 type AttachIssueChannelNotificationFromOriginParams struct {
@@ -149,6 +150,7 @@ type AttachIssueChannelNotificationFromOriginRow struct {
 	AvailableAt            pgtype.Timestamptz `json:"available_at"`
 	LeaseToken             pgtype.UUID        `json:"lease_token"`
 	LeaseExpiresAt         pgtype.Timestamptz `json:"lease_expires_at"`
+	ClaimCount             int32              `json:"claim_count"`
 	Attempts               int32              `json:"attempts"`
 	ReconciliationAttempts int32              `json:"reconciliation_attempts"`
 	LastError              pgtype.Text        `json:"last_error"`
@@ -192,6 +194,7 @@ func (q *Queries) AttachIssueChannelNotificationFromOrigin(ctx context.Context, 
 		&i.AvailableAt,
 		&i.LeaseToken,
 		&i.LeaseExpiresAt,
+		&i.ClaimCount,
 		&i.Attempts,
 		&i.ReconciliationAttempts,
 		&i.LastError,
@@ -207,35 +210,106 @@ func (q *Queries) AttachIssueChannelNotificationFromOrigin(ctx context.Context, 
 }
 
 const auditClaimedIssueChannelNotificationAttempt = `-- name: AuditClaimedIssueChannelNotificationAttempt :one
-INSERT INTO issue_channel_notification_audit (
-    issue_id, workspace_id, created_by_task_id, installation_id,
-    event_type, phase, attempt_number, lease_token
+WITH started AS (
+    UPDATE issue_channel_notification AS n
+    SET attempts = CASE WHEN n.status = 'queued' THEN n.attempts + 1 ELSE n.attempts END,
+        reconciliation_attempts = CASE
+            WHEN n.status = 'reconciling' THEN n.reconciliation_attempts + 1
+            ELSE n.reconciliation_attempts
+        END,
+        updated_at = now()
+    WHERE n.issue_id = $1
+      AND n.workspace_id = $2
+      AND n.lease_token = $3
+      AND n.status IN ('queued', 'reconciling')
+    RETURNING n.issue_id, n.workspace_id, n.created_by_task_id, n.initiator_user_id, n.chat_session_id, n.installation_id, n.channel_type, n.channel_app_id, n.channel_team_id, n.channel_id, n.thread_ts, n.status, n.available_at, n.lease_token, n.lease_expires_at, n.claim_count, n.attempts, n.reconciliation_attempts, n.last_error, n.slack_message_ts, n.delivered_at, n.failed_at, n.created_at, n.queued_at, n.cancelled_at, n.updated_at
+), audited AS (
+    INSERT INTO issue_channel_notification_audit (
+        issue_id, workspace_id, created_by_task_id, installation_id,
+        event_type, phase, attempt_number, lease_token
+    )
+    SELECT issue_id, workspace_id, created_by_task_id, installation_id,
+           'delivery_attempt',
+           CASE WHEN status = 'reconciling' THEN 'reconcile' ELSE 'send' END,
+           CASE WHEN status = 'reconciling' THEN reconciliation_attempts ELSE attempts END,
+           lease_token
+    FROM started
+    RETURNING id
 )
-SELECT issue_id, workspace_id, created_by_task_id, installation_id,
-       'delivery_attempt',
-       CASE WHEN status = 'reconciling' THEN 'reconcile' ELSE 'send' END,
-       CASE WHEN status = 'reconciling' THEN reconciliation_attempts + 1 ELSE attempts + 1 END,
-       lease_token
-FROM issue_channel_notification AS n
-WHERE n.issue_id = $1
-  AND n.lease_token = $2
-  AND n.status IN ('queued', 'reconciling')
-RETURNING id
+SELECT started.issue_id, started.workspace_id, started.created_by_task_id, started.initiator_user_id, started.chat_session_id, started.installation_id, started.channel_type, started.channel_app_id, started.channel_team_id, started.channel_id, started.thread_ts, started.status, started.available_at, started.lease_token, started.lease_expires_at, started.claim_count, started.attempts, started.reconciliation_attempts, started.last_error, started.slack_message_ts, started.delivered_at, started.failed_at, started.created_at, started.queued_at, started.cancelled_at, started.updated_at FROM started JOIN audited ON TRUE
 `
 
 type AuditClaimedIssueChannelNotificationAttemptParams struct {
-	IssueID    pgtype.UUID `json:"issue_id"`
-	LeaseToken pgtype.UUID `json:"lease_token"`
+	IssueID     pgtype.UUID `json:"issue_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	LeaseToken  pgtype.UUID `json:"lease_token"`
+}
+
+type AuditClaimedIssueChannelNotificationAttemptRow struct {
+	IssueID                pgtype.UUID        `json:"issue_id"`
+	WorkspaceID            pgtype.UUID        `json:"workspace_id"`
+	CreatedByTaskID        pgtype.UUID        `json:"created_by_task_id"`
+	InitiatorUserID        pgtype.UUID        `json:"initiator_user_id"`
+	ChatSessionID          pgtype.UUID        `json:"chat_session_id"`
+	InstallationID         pgtype.UUID        `json:"installation_id"`
+	ChannelType            string             `json:"channel_type"`
+	ChannelAppID           string             `json:"channel_app_id"`
+	ChannelTeamID          string             `json:"channel_team_id"`
+	ChannelID              string             `json:"channel_id"`
+	ThreadTs               string             `json:"thread_ts"`
+	Status                 string             `json:"status"`
+	AvailableAt            pgtype.Timestamptz `json:"available_at"`
+	LeaseToken             pgtype.UUID        `json:"lease_token"`
+	LeaseExpiresAt         pgtype.Timestamptz `json:"lease_expires_at"`
+	ClaimCount             int32              `json:"claim_count"`
+	Attempts               int32              `json:"attempts"`
+	ReconciliationAttempts int32              `json:"reconciliation_attempts"`
+	LastError              pgtype.Text        `json:"last_error"`
+	SlackMessageTs         pgtype.Text        `json:"slack_message_ts"`
+	DeliveredAt            pgtype.Timestamptz `json:"delivered_at"`
+	FailedAt               pgtype.Timestamptz `json:"failed_at"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	QueuedAt               pgtype.Timestamptz `json:"queued_at"`
+	CancelledAt            pgtype.Timestamptz `json:"cancelled_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
 }
 
 // Written immediately before the worker performs either the Slack POST path or
-// read-only reconciliation. The lease fence prevents a stale worker from
-// recording (or making) an attempt after ownership moved to another replica.
-func (q *Queries) AuditClaimedIssueChannelNotificationAttempt(ctx context.Context, arg AuditClaimedIssueChannelNotificationAttemptParams) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, auditClaimedIssueChannelNotificationAttempt, arg.IssueID, arg.LeaseToken)
-	var id pgtype.UUID
-	err := row.Scan(&id)
-	return id, err
+// read-only reconciliation. Incrementing the matching budget and appending the
+// audit row are one statement, so a crash or audit failure before this point
+// never consumes an external delivery attempt.
+func (q *Queries) AuditClaimedIssueChannelNotificationAttempt(ctx context.Context, arg AuditClaimedIssueChannelNotificationAttemptParams) (AuditClaimedIssueChannelNotificationAttemptRow, error) {
+	row := q.db.QueryRow(ctx, auditClaimedIssueChannelNotificationAttempt, arg.IssueID, arg.WorkspaceID, arg.LeaseToken)
+	var i AuditClaimedIssueChannelNotificationAttemptRow
+	err := row.Scan(
+		&i.IssueID,
+		&i.WorkspaceID,
+		&i.CreatedByTaskID,
+		&i.InitiatorUserID,
+		&i.ChatSessionID,
+		&i.InstallationID,
+		&i.ChannelType,
+		&i.ChannelAppID,
+		&i.ChannelTeamID,
+		&i.ChannelID,
+		&i.ThreadTs,
+		&i.Status,
+		&i.AvailableAt,
+		&i.LeaseToken,
+		&i.LeaseExpiresAt,
+		&i.ClaimCount,
+		&i.Attempts,
+		&i.ReconciliationAttempts,
+		&i.LastError,
+		&i.SlackMessageTs,
+		&i.DeliveredAt,
+		&i.FailedAt,
+		&i.CreatedAt,
+		&i.QueuedAt,
+		&i.CancelledAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const cancelIssueChannelNotificationsByChatSession = `-- name: CancelIssueChannelNotificationsByChatSession :exec
@@ -249,7 +323,7 @@ WITH cancelled AS (
         updated_at = now()
     WHERE chat_session_id = $2
       AND status IN ('awaiting', 'queued', 'reconciling')
-    RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
+    RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, claim_count, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
 )
 INSERT INTO issue_channel_notification_audit (
     issue_id, workspace_id, created_by_task_id, installation_id,
@@ -281,7 +355,7 @@ WITH cancelled AS (
         updated_at = now()
     WHERE n.installation_id = $2
       AND n.status IN ('awaiting', 'queued', 'reconciling')
-    RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
+    RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, claim_count, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
 )
 INSERT INTO issue_channel_notification_audit (
     issue_id, workspace_id, created_by_task_id, installation_id,
@@ -318,10 +392,11 @@ WITH candidate AS (
 UPDATE issue_channel_notification AS n
 SET lease_token = gen_random_uuid(),
     lease_expires_at = now() + interval '2 minutes',
+    claim_count = claim_count + 1,
     updated_at = now()
 FROM candidate
 WHERE n.issue_id = candidate.issue_id
-RETURNING n.issue_id, n.workspace_id, n.created_by_task_id, n.initiator_user_id, n.chat_session_id, n.installation_id, n.channel_type, n.channel_app_id, n.channel_team_id, n.channel_id, n.thread_ts, n.status, n.available_at, n.lease_token, n.lease_expires_at, n.attempts, n.reconciliation_attempts, n.last_error, n.slack_message_ts, n.delivered_at, n.failed_at, n.created_at, n.queued_at, n.cancelled_at, n.updated_at
+RETURNING n.issue_id, n.workspace_id, n.created_by_task_id, n.initiator_user_id, n.chat_session_id, n.installation_id, n.channel_type, n.channel_app_id, n.channel_team_id, n.channel_id, n.thread_ts, n.status, n.available_at, n.lease_token, n.lease_expires_at, n.claim_count, n.attempts, n.reconciliation_attempts, n.last_error, n.slack_message_ts, n.delivered_at, n.failed_at, n.created_at, n.queued_at, n.cancelled_at, n.updated_at
 `
 
 func (q *Queries) ClaimQueuedIssueChannelNotification(ctx context.Context) (IssueChannelNotification, error) {
@@ -343,6 +418,7 @@ func (q *Queries) ClaimQueuedIssueChannelNotification(ctx context.Context) (Issu
 		&i.AvailableAt,
 		&i.LeaseToken,
 		&i.LeaseExpiresAt,
+		&i.ClaimCount,
 		&i.Attempts,
 		&i.ReconciliationAttempts,
 		&i.LastError,
@@ -380,7 +456,7 @@ WITH inserted AS (
       AND COALESCE(ci.config ->> 'team_id', '') <> ''
       AND $2::text <> ''
     ON CONFLICT DO NOTHING
-    RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
+    RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, claim_count, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
 ), audited AS (
     INSERT INTO issue_channel_notification_audit (
         issue_id, workspace_id, created_by_task_id, installation_id,
@@ -390,7 +466,7 @@ WITH inserted AS (
            'target_created', jsonb_build_object('delivery_scope', 'channel')
     FROM inserted
 )
-SELECT issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at FROM inserted
+SELECT issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, claim_count, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at FROM inserted
 `
 
 type CreateSlackSlashIssueChannelNotificationTargetParams struct {
@@ -417,6 +493,7 @@ type CreateSlackSlashIssueChannelNotificationTargetRow struct {
 	AvailableAt            pgtype.Timestamptz `json:"available_at"`
 	LeaseToken             pgtype.UUID        `json:"lease_token"`
 	LeaseExpiresAt         pgtype.Timestamptz `json:"lease_expires_at"`
+	ClaimCount             int32              `json:"claim_count"`
 	Attempts               int32              `json:"attempts"`
 	ReconciliationAttempts int32              `json:"reconciliation_attempts"`
 	LastError              pgtype.Text        `json:"last_error"`
@@ -457,6 +534,7 @@ func (q *Queries) CreateSlackSlashIssueChannelNotificationTarget(ctx context.Con
 		&i.AvailableAt,
 		&i.LeaseToken,
 		&i.LeaseExpiresAt,
+		&i.ClaimCount,
 		&i.Attempts,
 		&i.ReconciliationAttempts,
 		&i.LastError,
@@ -478,19 +556,26 @@ SET available_at = $1,
     lease_expires_at = NULL,
     updated_at = now()
 WHERE issue_id = $2
-  AND lease_token = $3
+  AND workspace_id = $3
+  AND lease_token = $4
   AND status IN ('queued', 'reconciling')
-RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
+RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, claim_count, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
 `
 
 type DeferClaimedIssueChannelNotificationParams struct {
 	AvailableAt pgtype.Timestamptz `json:"available_at"`
 	IssueID     pgtype.UUID        `json:"issue_id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
 	LeaseToken  pgtype.UUID        `json:"lease_token"`
 }
 
 func (q *Queries) DeferClaimedIssueChannelNotification(ctx context.Context, arg DeferClaimedIssueChannelNotificationParams) (IssueChannelNotification, error) {
-	row := q.db.QueryRow(ctx, deferClaimedIssueChannelNotification, arg.AvailableAt, arg.IssueID, arg.LeaseToken)
+	row := q.db.QueryRow(ctx, deferClaimedIssueChannelNotification,
+		arg.AvailableAt,
+		arg.IssueID,
+		arg.WorkspaceID,
+		arg.LeaseToken,
+	)
 	var i IssueChannelNotification
 	err := row.Scan(
 		&i.IssueID,
@@ -508,6 +593,7 @@ func (q *Queries) DeferClaimedIssueChannelNotification(ctx context.Context, arg 
 		&i.AvailableAt,
 		&i.LeaseToken,
 		&i.LeaseExpiresAt,
+		&i.ClaimCount,
 		&i.Attempts,
 		&i.ReconciliationAttempts,
 		&i.LastError,
@@ -525,20 +611,26 @@ func (q *Queries) DeferClaimedIssueChannelNotification(ctx context.Context, arg 
 const deleteIssueChannelNotificationByIssue = `-- name: DeleteIssueChannelNotificationByIssue :exec
 WITH deleted AS (
     DELETE FROM issue_channel_notification AS n
-    WHERE n.issue_id = $1 AND n.workspace_id = $2
+    WHERE n.issue_id = $2 AND n.workspace_id = $1
+    RETURNING n.created_by_task_id
 )
 DELETE FROM issue_channel_notification_audit
-WHERE issue_channel_notification_audit.issue_id = $1
-  AND issue_channel_notification_audit.workspace_id = $2
+WHERE issue_channel_notification_audit.workspace_id = $1
+  AND (
+      issue_channel_notification_audit.issue_id = $2
+      OR issue_channel_notification_audit.created_by_task_id IN (
+          SELECT created_by_task_id FROM deleted WHERE created_by_task_id IS NOT NULL
+      )
+  )
 `
 
 type DeleteIssueChannelNotificationByIssueParams struct {
-	IssueID     pgtype.UUID `json:"issue_id"`
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	IssueID     pgtype.UUID `json:"issue_id"`
 }
 
 func (q *Queries) DeleteIssueChannelNotificationByIssue(ctx context.Context, arg DeleteIssueChannelNotificationByIssueParams) error {
-	_, err := q.db.Exec(ctx, deleteIssueChannelNotificationByIssue, arg.IssueID, arg.WorkspaceID)
+	_, err := q.db.Exec(ctx, deleteIssueChannelNotificationByIssue, arg.WorkspaceID, arg.IssueID)
 	return err
 }
 
@@ -559,7 +651,6 @@ const deliverClaimedIssueChannelNotification = `-- name: DeliverClaimedIssueChan
 WITH delivered AS (
     UPDATE issue_channel_notification AS n
     SET status = 'delivered',
-        attempts = attempts + 1,
         last_error = NULL,
         slack_message_ts = $1,
         delivered_at = now(),
@@ -567,9 +658,10 @@ WITH delivered AS (
         lease_expires_at = NULL,
         updated_at = now()
     WHERE n.issue_id = $2
-      AND n.lease_token = $3
+      AND n.workspace_id = $3
+      AND n.lease_token = $4
       AND n.status = 'queued'
-    RETURNING n.issue_id, n.workspace_id, n.created_by_task_id, n.initiator_user_id, n.chat_session_id, n.installation_id, n.channel_type, n.channel_app_id, n.channel_team_id, n.channel_id, n.thread_ts, n.status, n.available_at, n.lease_token, n.lease_expires_at, n.attempts, n.reconciliation_attempts, n.last_error, n.slack_message_ts, n.delivered_at, n.failed_at, n.created_at, n.queued_at, n.cancelled_at, n.updated_at
+    RETURNING n.issue_id, n.workspace_id, n.created_by_task_id, n.initiator_user_id, n.chat_session_id, n.installation_id, n.channel_type, n.channel_app_id, n.channel_team_id, n.channel_id, n.thread_ts, n.status, n.available_at, n.lease_token, n.lease_expires_at, n.claim_count, n.attempts, n.reconciliation_attempts, n.last_error, n.slack_message_ts, n.delivered_at, n.failed_at, n.created_at, n.queued_at, n.cancelled_at, n.updated_at
 ), audited AS (
     INSERT INTO issue_channel_notification_audit (
         issue_id, workspace_id, created_by_task_id, installation_id,
@@ -585,11 +677,17 @@ SELECT issue_id FROM delivered
 type DeliverClaimedIssueChannelNotificationParams struct {
 	SlackMessageTs pgtype.Text `json:"slack_message_ts"`
 	IssueID        pgtype.UUID `json:"issue_id"`
+	WorkspaceID    pgtype.UUID `json:"workspace_id"`
 	LeaseToken     pgtype.UUID `json:"lease_token"`
 }
 
 func (q *Queries) DeliverClaimedIssueChannelNotification(ctx context.Context, arg DeliverClaimedIssueChannelNotificationParams) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, deliverClaimedIssueChannelNotification, arg.SlackMessageTs, arg.IssueID, arg.LeaseToken)
+	row := q.db.QueryRow(ctx, deliverClaimedIssueChannelNotification,
+		arg.SlackMessageTs,
+		arg.IssueID,
+		arg.WorkspaceID,
+		arg.LeaseToken,
+	)
 	var issue_id pgtype.UUID
 	err := row.Scan(&issue_id)
 	return issue_id, err
@@ -606,16 +704,17 @@ WITH delivered AS (
         lease_expires_at = NULL,
         updated_at = now()
     WHERE n.issue_id = $2
-      AND n.lease_token = $3
+      AND n.workspace_id = $3
+      AND n.lease_token = $4
       AND n.status = 'reconciling'
-    RETURNING n.issue_id, n.workspace_id, n.created_by_task_id, n.initiator_user_id, n.chat_session_id, n.installation_id, n.channel_type, n.channel_app_id, n.channel_team_id, n.channel_id, n.thread_ts, n.status, n.available_at, n.lease_token, n.lease_expires_at, n.attempts, n.reconciliation_attempts, n.last_error, n.slack_message_ts, n.delivered_at, n.failed_at, n.created_at, n.queued_at, n.cancelled_at, n.updated_at
+    RETURNING n.issue_id, n.workspace_id, n.created_by_task_id, n.initiator_user_id, n.chat_session_id, n.installation_id, n.channel_type, n.channel_app_id, n.channel_team_id, n.channel_id, n.thread_ts, n.status, n.available_at, n.lease_token, n.lease_expires_at, n.claim_count, n.attempts, n.reconciliation_attempts, n.last_error, n.slack_message_ts, n.delivered_at, n.failed_at, n.created_at, n.queued_at, n.cancelled_at, n.updated_at
 ), audited AS (
     INSERT INTO issue_channel_notification_audit (
         issue_id, workspace_id, created_by_task_id, installation_id,
         event_type, phase, attempt_number, slack_message_ts
     )
     SELECT issue_id, workspace_id, created_by_task_id, installation_id,
-           'delivered', 'reconcile', reconciliation_attempts + 1, $1
+           'delivered', 'reconcile', reconciliation_attempts, $1
     FROM delivered
 )
 SELECT issue_id FROM delivered
@@ -624,11 +723,17 @@ SELECT issue_id FROM delivered
 type DeliverReconcilingIssueChannelNotificationParams struct {
 	SlackMessageTs pgtype.Text `json:"slack_message_ts"`
 	IssueID        pgtype.UUID `json:"issue_id"`
+	WorkspaceID    pgtype.UUID `json:"workspace_id"`
 	LeaseToken     pgtype.UUID `json:"lease_token"`
 }
 
 func (q *Queries) DeliverReconcilingIssueChannelNotification(ctx context.Context, arg DeliverReconcilingIssueChannelNotificationParams) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, deliverReconcilingIssueChannelNotification, arg.SlackMessageTs, arg.IssueID, arg.LeaseToken)
+	row := q.db.QueryRow(ctx, deliverReconcilingIssueChannelNotification,
+		arg.SlackMessageTs,
+		arg.IssueID,
+		arg.WorkspaceID,
+		arg.LeaseToken,
+	)
 	var issue_id pgtype.UUID
 	err := row.Scan(&issue_id)
 	return issue_id, err
@@ -638,16 +743,16 @@ const failClaimedIssueChannelNotification = `-- name: FailClaimedIssueChannelNot
 WITH failed AS (
     UPDATE issue_channel_notification AS n
     SET status = 'failed',
-        attempts = attempts + 1,
         last_error = $1,
         failed_at = now(),
         lease_token = NULL,
         lease_expires_at = NULL,
         updated_at = now()
     WHERE n.issue_id = $2
-      AND n.lease_token = $3
+      AND n.workspace_id = $3
+      AND n.lease_token = $4
       AND n.status = 'queued'
-    RETURNING n.issue_id, n.workspace_id, n.created_by_task_id, n.initiator_user_id, n.chat_session_id, n.installation_id, n.channel_type, n.channel_app_id, n.channel_team_id, n.channel_id, n.thread_ts, n.status, n.available_at, n.lease_token, n.lease_expires_at, n.attempts, n.reconciliation_attempts, n.last_error, n.slack_message_ts, n.delivered_at, n.failed_at, n.created_at, n.queued_at, n.cancelled_at, n.updated_at
+    RETURNING n.issue_id, n.workspace_id, n.created_by_task_id, n.initiator_user_id, n.chat_session_id, n.installation_id, n.channel_type, n.channel_app_id, n.channel_team_id, n.channel_id, n.thread_ts, n.status, n.available_at, n.lease_token, n.lease_expires_at, n.claim_count, n.attempts, n.reconciliation_attempts, n.last_error, n.slack_message_ts, n.delivered_at, n.failed_at, n.created_at, n.queued_at, n.cancelled_at, n.updated_at
 ), audited AS (
     INSERT INTO issue_channel_notification_audit (
         issue_id, workspace_id, created_by_task_id, installation_id,
@@ -661,13 +766,19 @@ SELECT issue_id FROM failed
 `
 
 type FailClaimedIssueChannelNotificationParams struct {
-	LastError  pgtype.Text `json:"last_error"`
-	IssueID    pgtype.UUID `json:"issue_id"`
-	LeaseToken pgtype.UUID `json:"lease_token"`
+	LastError   pgtype.Text `json:"last_error"`
+	IssueID     pgtype.UUID `json:"issue_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	LeaseToken  pgtype.UUID `json:"lease_token"`
 }
 
 func (q *Queries) FailClaimedIssueChannelNotification(ctx context.Context, arg FailClaimedIssueChannelNotificationParams) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, failClaimedIssueChannelNotification, arg.LastError, arg.IssueID, arg.LeaseToken)
+	row := q.db.QueryRow(ctx, failClaimedIssueChannelNotification,
+		arg.LastError,
+		arg.IssueID,
+		arg.WorkspaceID,
+		arg.LeaseToken,
+	)
 	var issue_id pgtype.UUID
 	err := row.Scan(&issue_id)
 	return issue_id, err
@@ -683,29 +794,36 @@ WITH failed AS (
         lease_expires_at = NULL,
         updated_at = now()
     WHERE n.issue_id = $2
-      AND n.lease_token = $3
+      AND n.workspace_id = $3
+      AND n.lease_token = $4
       AND n.status = 'reconciling'
-    RETURNING n.issue_id, n.workspace_id, n.created_by_task_id, n.initiator_user_id, n.chat_session_id, n.installation_id, n.channel_type, n.channel_app_id, n.channel_team_id, n.channel_id, n.thread_ts, n.status, n.available_at, n.lease_token, n.lease_expires_at, n.attempts, n.reconciliation_attempts, n.last_error, n.slack_message_ts, n.delivered_at, n.failed_at, n.created_at, n.queued_at, n.cancelled_at, n.updated_at
+    RETURNING n.issue_id, n.workspace_id, n.created_by_task_id, n.initiator_user_id, n.chat_session_id, n.installation_id, n.channel_type, n.channel_app_id, n.channel_team_id, n.channel_id, n.thread_ts, n.status, n.available_at, n.lease_token, n.lease_expires_at, n.claim_count, n.attempts, n.reconciliation_attempts, n.last_error, n.slack_message_ts, n.delivered_at, n.failed_at, n.created_at, n.queued_at, n.cancelled_at, n.updated_at
 ), audited AS (
     INSERT INTO issue_channel_notification_audit (
         issue_id, workspace_id, created_by_task_id, installation_id,
         event_type, phase, attempt_number, error
     )
     SELECT issue_id, workspace_id, created_by_task_id, installation_id,
-           'failed', 'reconcile', reconciliation_attempts + 1, last_error
+           'failed', 'reconcile', reconciliation_attempts, last_error
     FROM failed
 )
 SELECT issue_id FROM failed
 `
 
 type FailReconcilingIssueChannelNotificationParams struct {
-	LastError  pgtype.Text `json:"last_error"`
-	IssueID    pgtype.UUID `json:"issue_id"`
-	LeaseToken pgtype.UUID `json:"lease_token"`
+	LastError   pgtype.Text `json:"last_error"`
+	IssueID     pgtype.UUID `json:"issue_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	LeaseToken  pgtype.UUID `json:"lease_token"`
 }
 
 func (q *Queries) FailReconcilingIssueChannelNotification(ctx context.Context, arg FailReconcilingIssueChannelNotificationParams) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, failReconcilingIssueChannelNotification, arg.LastError, arg.IssueID, arg.LeaseToken)
+	row := q.db.QueryRow(ctx, failReconcilingIssueChannelNotification,
+		arg.LastError,
+		arg.IssueID,
+		arg.WorkspaceID,
+		arg.LeaseToken,
+	)
 	var issue_id pgtype.UUID
 	err := row.Scan(&issue_id)
 	return issue_id, err
@@ -731,13 +849,6 @@ WITH target_issue AS (
     JOIN issue_vcs_pull_request ipr ON ipr.pull_request_id = pr.id
     JOIN target_issue i ON i.id = ipr.issue_id
     WHERE NOT ipr.reference_only AND pr.html_url <> ''
-    UNION ALL
-    SELECT 'comment'::text, c.content::text, ''::text, c.created_at, 2
-    FROM comment c
-    JOIN target_issue i ON i.id = c.issue_id
-    WHERE c.workspace_id = $2::uuid
-      AND c.author_type = 'agent'
-      AND c.content <> ''
 )
 SELECT kind, value, result_state
 FROM candidates
@@ -756,14 +867,67 @@ type GetIssueChannelNotificationHandoffRow struct {
 	ResultState string `json:"result_state"`
 }
 
-// Prefer the newest working PR/MR result link. When an issue has no linked PR,
-// fall back to the latest agent-authored issue comment, which is the durable
-// handoff invariant enforced by TaskService completion. The sender applies
-// secret redaction and a rune bound before this leaves Multica.
+// Return only a linked PR/MR result. Agent comments can contain customer data,
+// raw traces, or other private evidence that deterministic secret redaction
+// cannot safely classify; those details remain on the authorized issue page.
 func (q *Queries) GetIssueChannelNotificationHandoff(ctx context.Context, arg GetIssueChannelNotificationHandoffParams) (GetIssueChannelNotificationHandoffRow, error) {
 	row := q.db.QueryRow(ctx, getIssueChannelNotificationHandoff, arg.IssueID, arg.WorkspaceID)
 	var i GetIssueChannelNotificationHandoffRow
 	err := row.Scan(&i.Kind, &i.Value, &i.ResultState)
+	return i, err
+}
+
+const lockClaimedIssueChannelNotificationForDelivery = `-- name: LockClaimedIssueChannelNotificationForDelivery :one
+SELECT issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, claim_count, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at FROM issue_channel_notification AS n
+WHERE n.issue_id = $1
+  AND n.workspace_id = $2
+  AND n.lease_token = $3
+  AND n.status IN ('queued', 'reconciling')
+FOR UPDATE
+`
+
+type LockClaimedIssueChannelNotificationForDeliveryParams struct {
+	IssueID     pgtype.UUID `json:"issue_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	LeaseToken  pgtype.UUID `json:"lease_token"`
+}
+
+// The worker first takes a shared installation lock, then this row lock, and
+// holds both through the bounded Slack call and terminal audit write. Every
+// administrative mutation either updates the installation first or waits on
+// this row, so an accepted POST cannot be concurrently recorded as cancelled
+// or deleted.
+func (q *Queries) LockClaimedIssueChannelNotificationForDelivery(ctx context.Context, arg LockClaimedIssueChannelNotificationForDeliveryParams) (IssueChannelNotification, error) {
+	row := q.db.QueryRow(ctx, lockClaimedIssueChannelNotificationForDelivery, arg.IssueID, arg.WorkspaceID, arg.LeaseToken)
+	var i IssueChannelNotification
+	err := row.Scan(
+		&i.IssueID,
+		&i.WorkspaceID,
+		&i.CreatedByTaskID,
+		&i.InitiatorUserID,
+		&i.ChatSessionID,
+		&i.InstallationID,
+		&i.ChannelType,
+		&i.ChannelAppID,
+		&i.ChannelTeamID,
+		&i.ChannelID,
+		&i.ThreadTs,
+		&i.Status,
+		&i.AvailableAt,
+		&i.LeaseToken,
+		&i.LeaseExpiresAt,
+		&i.ClaimCount,
+		&i.Attempts,
+		&i.ReconciliationAttempts,
+		&i.LastError,
+		&i.SlackMessageTs,
+		&i.DeliveredAt,
+		&i.FailedAt,
+		&i.CreatedAt,
+		&i.QueuedAt,
+		&i.CancelledAt,
+		&i.UpdatedAt,
+	)
 	return i, err
 }
 
@@ -777,7 +941,7 @@ WITH updated AS (
     WHERE n.issue_id = $1
       AND n.workspace_id = $2
       AND n.status = 'awaiting'
-    RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
+    RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, claim_count, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
 ), audited AS (
     INSERT INTO issue_channel_notification_audit (
         issue_id, workspace_id, created_by_task_id, installation_id, event_type
@@ -785,7 +949,7 @@ WITH updated AS (
     SELECT issue_id, workspace_id, created_by_task_id, installation_id, 'queued'
     FROM updated
 )
-SELECT issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at FROM updated
+SELECT issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, claim_count, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at FROM updated
 `
 
 type QueueIssueChannelNotificationParams struct {
@@ -809,6 +973,7 @@ type QueueIssueChannelNotificationRow struct {
 	AvailableAt            pgtype.Timestamptz `json:"available_at"`
 	LeaseToken             pgtype.UUID        `json:"lease_token"`
 	LeaseExpiresAt         pgtype.Timestamptz `json:"lease_expires_at"`
+	ClaimCount             int32              `json:"claim_count"`
 	Attempts               int32              `json:"attempts"`
 	ReconciliationAttempts int32              `json:"reconciliation_attempts"`
 	LastError              pgtype.Text        `json:"last_error"`
@@ -842,6 +1007,7 @@ func (q *Queries) QueueIssueChannelNotification(ctx context.Context, arg QueueIs
 		&i.AvailableAt,
 		&i.LeaseToken,
 		&i.LeaseExpiresAt,
+		&i.ClaimCount,
 		&i.Attempts,
 		&i.ReconciliationAttempts,
 		&i.LastError,
@@ -860,21 +1026,22 @@ const reconcileClaimedIssueChannelNotification = `-- name: ReconcileClaimedIssue
 UPDATE issue_channel_notification
 SET status = 'reconciling',
     available_at = $1,
-    attempts = attempts + 1,
     last_error = $2,
     lease_token = NULL,
     lease_expires_at = NULL,
     updated_at = now()
 WHERE issue_id = $3
-  AND lease_token = $4
+  AND workspace_id = $4
+  AND lease_token = $5
   AND status = 'queued'
-RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
+RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, claim_count, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
 `
 
 type ReconcileClaimedIssueChannelNotificationParams struct {
 	AvailableAt pgtype.Timestamptz `json:"available_at"`
 	LastError   pgtype.Text        `json:"last_error"`
 	IssueID     pgtype.UUID        `json:"issue_id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
 	LeaseToken  pgtype.UUID        `json:"lease_token"`
 }
 
@@ -883,6 +1050,7 @@ func (q *Queries) ReconcileClaimedIssueChannelNotification(ctx context.Context, 
 		arg.AvailableAt,
 		arg.LastError,
 		arg.IssueID,
+		arg.WorkspaceID,
 		arg.LeaseToken,
 	)
 	var i IssueChannelNotification
@@ -902,6 +1070,7 @@ func (q *Queries) ReconcileClaimedIssueChannelNotification(ctx context.Context, 
 		&i.AvailableAt,
 		&i.LeaseToken,
 		&i.LeaseExpiresAt,
+		&i.ClaimCount,
 		&i.Attempts,
 		&i.ReconciliationAttempts,
 		&i.LastError,
@@ -919,21 +1088,22 @@ func (q *Queries) ReconcileClaimedIssueChannelNotification(ctx context.Context, 
 const retryClaimedIssueChannelNotification = `-- name: RetryClaimedIssueChannelNotification :one
 UPDATE issue_channel_notification
 SET available_at = $1,
-    attempts = attempts + 1,
     last_error = $2,
     lease_token = NULL,
     lease_expires_at = NULL,
     updated_at = now()
 WHERE issue_id = $3
-  AND lease_token = $4
+  AND workspace_id = $4
+  AND lease_token = $5
   AND status = 'queued'
-RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
+RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, claim_count, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
 `
 
 type RetryClaimedIssueChannelNotificationParams struct {
 	AvailableAt pgtype.Timestamptz `json:"available_at"`
 	LastError   pgtype.Text        `json:"last_error"`
 	IssueID     pgtype.UUID        `json:"issue_id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
 	LeaseToken  pgtype.UUID        `json:"lease_token"`
 }
 
@@ -942,6 +1112,7 @@ func (q *Queries) RetryClaimedIssueChannelNotification(ctx context.Context, arg 
 		arg.AvailableAt,
 		arg.LastError,
 		arg.IssueID,
+		arg.WorkspaceID,
 		arg.LeaseToken,
 	)
 	var i IssueChannelNotification
@@ -961,6 +1132,7 @@ func (q *Queries) RetryClaimedIssueChannelNotification(ctx context.Context, arg 
 		&i.AvailableAt,
 		&i.LeaseToken,
 		&i.LeaseExpiresAt,
+		&i.ClaimCount,
 		&i.Attempts,
 		&i.ReconciliationAttempts,
 		&i.LastError,
@@ -978,21 +1150,22 @@ func (q *Queries) RetryClaimedIssueChannelNotification(ctx context.Context, arg 
 const retryReconcilingIssueChannelNotification = `-- name: RetryReconcilingIssueChannelNotification :one
 UPDATE issue_channel_notification
 SET available_at = $1,
-    reconciliation_attempts = reconciliation_attempts + 1,
     last_error = $2,
     lease_token = NULL,
     lease_expires_at = NULL,
     updated_at = now()
 WHERE issue_id = $3
-  AND lease_token = $4
+  AND workspace_id = $4
+  AND lease_token = $5
   AND status = 'reconciling'
-RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
+RETURNING issue_id, workspace_id, created_by_task_id, initiator_user_id, chat_session_id, installation_id, channel_type, channel_app_id, channel_team_id, channel_id, thread_ts, status, available_at, lease_token, lease_expires_at, claim_count, attempts, reconciliation_attempts, last_error, slack_message_ts, delivered_at, failed_at, created_at, queued_at, cancelled_at, updated_at
 `
 
 type RetryReconcilingIssueChannelNotificationParams struct {
 	AvailableAt pgtype.Timestamptz `json:"available_at"`
 	LastError   pgtype.Text        `json:"last_error"`
 	IssueID     pgtype.UUID        `json:"issue_id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
 	LeaseToken  pgtype.UUID        `json:"lease_token"`
 }
 
@@ -1001,6 +1174,7 @@ func (q *Queries) RetryReconcilingIssueChannelNotification(ctx context.Context, 
 		arg.AvailableAt,
 		arg.LastError,
 		arg.IssueID,
+		arg.WorkspaceID,
 		arg.LeaseToken,
 	)
 	var i IssueChannelNotification
@@ -1020,6 +1194,7 @@ func (q *Queries) RetryReconcilingIssueChannelNotification(ctx context.Context, 
 		&i.AvailableAt,
 		&i.LeaseToken,
 		&i.LeaseExpiresAt,
+		&i.ClaimCount,
 		&i.Attempts,
 		&i.ReconciliationAttempts,
 		&i.LastError,

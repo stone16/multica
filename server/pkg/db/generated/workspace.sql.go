@@ -399,6 +399,20 @@ func (q *Queries) LockWorkspaceForDelete(ctx context.Context, id pgtype.UUID) (p
 	return id_2, err
 }
 
+const lockWorkspaceForIssueNotification = `-- name: LockWorkspaceForIssueNotification :one
+SELECT id FROM workspace WHERE id = $1 FOR KEY SHARE
+`
+
+// Prevent workspace teardown from crossing an in-flight external delivery.
+// The worker takes parent locks in workspace -> issue -> chat -> installation
+// order before it locks the notification row.
+func (q *Queries) LockWorkspaceForIssueNotification(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, lockWorkspaceForIssueNotification, id)
+	var id_2 pgtype.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
 const updateWorkspace = `-- name: UpdateWorkspace :one
 UPDATE workspace SET
     name = COALESCE($2, name),

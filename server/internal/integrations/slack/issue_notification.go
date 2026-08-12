@@ -7,9 +7,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -17,11 +17,10 @@ import (
 
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
-	"github.com/multica-ai/multica/server/pkg/redact"
 )
 
 const issueNotificationMetadataType = "multica_issue_notification"
-const issueNotificationHandoffMaxRunes = 360
+const issueNotificationReconciliationMaxPages = 5
 
 // IssueNotification is the Slack transport boundary for durable issue handoff
 // notifications. Database ownership and retry scheduling stay in the worker;
@@ -77,46 +76,50 @@ func NewIssueNotification(q issueNotificationQueries, decrypt Decrypter, appURL 
 	return notification
 }
 
-func (n *IssueNotification) Send(ctx context.Context, row db.IssueChannelNotification) (IssueNotificationResult, error) {
-	return n.deliver(ctx, row, true)
+func (n *IssueNotification) Send(ctx context.Context, readDB db.DBTX, row db.IssueChannelNotification) (IssueNotificationResult, error) {
+	return n.deliver(ctx, readDB, row, true)
 }
 
 // Reconcile performs the same target and authorization validation as Send but
 // only reads Slack thread metadata. It is used after the final ambiguous POST;
 // found=false with nil error is a definitive absence and must never post.
-func (n *IssueNotification) Reconcile(ctx context.Context, row db.IssueChannelNotification) (IssueNotificationResult, bool, error) {
-	result, err := n.deliver(ctx, row, false)
+func (n *IssueNotification) Reconcile(ctx context.Context, readDB db.DBTX, row db.IssueChannelNotification) (IssueNotificationResult, bool, error) {
+	result, err := n.deliver(ctx, readDB, row, false)
 	if err != nil {
 		return IssueNotificationResult{}, false, err
 	}
 	return result, result.MessageTS != "", nil
 }
 
-func (n *IssueNotification) deliver(ctx context.Context, row db.IssueChannelNotification, allowPost bool) (IssueNotificationResult, error) {
+func (n *IssueNotification) deliver(ctx context.Context, readDB db.DBTX, row db.IssueChannelNotification, allowPost bool) (IssueNotificationResult, error) {
 	if n == nil || n.q == nil {
 		return IssueNotificationResult{}, permanentIssueNotificationError(errors.New("Slack issue notification is not configured"))
 	}
 	if row.ChannelType != string(TypeSlack) || row.ChannelID == "" || row.ChannelAppID == "" || row.ChannelTeamID == "" {
 		return IssueNotificationResult{}, permanentIssueNotificationError(errors.New("invalid Slack issue notification target"))
 	}
-	issue, err := n.q.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{ID: row.IssueID, WorkspaceID: row.WorkspaceID})
+	queries := n.q
+	if readDB != nil {
+		queries = db.New(readDB)
+	}
+	issue, err := queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{ID: row.IssueID, WorkspaceID: row.WorkspaceID})
 	if err != nil {
 		return IssueNotificationResult{}, classifyIssueNotificationLookupError("load issue", err)
 	}
 	if issue.Status != "in_review" && issue.Status != "done" {
 		return IssueNotificationResult{}, deferIssueNotificationError(fmt.Errorf("issue status is %s, not ready for notification", issue.Status))
 	}
-	workspace, err := n.q.GetWorkspace(ctx, row.WorkspaceID)
+	workspace, err := queries.GetWorkspace(ctx, row.WorkspaceID)
 	if err != nil {
 		return IssueNotificationResult{}, classifyIssueNotificationLookupError("load workspace", err)
 	}
 	if row.ChatSessionID.Valid {
-		if _, err := n.q.GetChatSessionInWorkspace(ctx, db.GetChatSessionInWorkspaceParams{
+		if _, err := queries.GetChatSessionInWorkspace(ctx, db.GetChatSessionInWorkspaceParams{
 			ID: row.ChatSessionID, WorkspaceID: row.WorkspaceID,
 		}); err != nil {
 			return IssueNotificationResult{}, classifyIssueNotificationLookupError("load Slack chat session", err)
 		}
-		binding, err := n.q.GetChannelChatSessionBindingBySession(ctx, db.GetChannelChatSessionBindingBySessionParams{
+		binding, err := queries.GetChannelChatSessionBindingBySession(ctx, db.GetChannelChatSessionBindingBySessionParams{
 			ChatSessionID: row.ChatSessionID, ChannelType: string(TypeSlack),
 		})
 		if err != nil {
@@ -127,7 +130,7 @@ func (n *IssueNotification) deliver(ctx context.Context, row db.IssueChannelNoti
 			return IssueNotificationResult{}, permanentIssueNotificationError(errors.New("Slack issue notification binding no longer matches its stored target"))
 		}
 	}
-	installation, err := n.q.GetChannelInstallationInWorkspace(ctx, db.GetChannelInstallationInWorkspaceParams{
+	installation, err := queries.GetChannelInstallationInWorkspace(ctx, db.GetChannelInstallationInWorkspaceParams{
 		ID: row.InstallationID, WorkspaceID: row.WorkspaceID, ChannelType: string(TypeSlack),
 	})
 	if err != nil {
@@ -148,12 +151,17 @@ func (n *IssueNotification) deliver(ctx context.Context, row db.IssueChannelNoti
 		return IssueNotificationResult{}, permanentIssueNotificationError(errors.New("Slack bot token is empty"))
 	}
 	client := n.client(creds.BotToken)
-	ts, found, reconcileErr := findIssueNotification(ctx, client, row)
-	if reconcileErr != nil {
-		return IssueNotificationResult{}, classifyIssueNotificationPrePostError(fmt.Errorf("reconcile Slack issue notification: %w", reconcileErr))
-	}
-	if found {
-		return IssueNotificationResult{MessageTS: ts}, nil
+	ts := ""
+	if !allowPost || row.ClaimCount > 1 {
+		var found bool
+		var reconcileErr error
+		ts, found, reconcileErr = findIssueNotification(ctx, client, row)
+		if reconcileErr != nil {
+			return IssueNotificationResult{}, classifyIssueNotificationPrePostError(fmt.Errorf("reconcile Slack issue notification: %w", reconcileErr))
+		}
+		if found {
+			return IssueNotificationResult{MessageTS: ts}, nil
+		}
 	}
 	if !allowPost {
 		return IssueNotificationResult{}, nil
@@ -171,11 +179,11 @@ func (n *IssueNotification) deliver(ctx context.Context, row db.IssueChannelNoti
 		verb = "is complete"
 	}
 	text := fmt.Sprintf(":white_check_mark: Issue *%s* %s.", issueLabel, verb)
-	if handoff, handoffErr := n.q.GetIssueChannelNotificationHandoff(ctx, db.GetIssueChannelNotificationHandoffParams{
+	if handoff, handoffErr := queries.GetIssueChannelNotificationHandoff(ctx, db.GetIssueChannelNotificationHandoffParams{
 		IssueID: row.IssueID, WorkspaceID: row.WorkspaceID,
-	}); handoffErr == nil {
+	}); handoffErr == nil && handoff.Kind == "pull_request" {
 		text += "\n" + formatIssueNotificationHandoff(handoff)
-	} else if !errors.Is(handoffErr, pgx.ErrNoRows) {
+	} else if handoffErr != nil && !errors.Is(handoffErr, pgx.ErrNoRows) {
 		return IssueNotificationResult{}, classifyIssueNotificationLookupError("load issue handoff", handoffErr)
 	}
 	text += "\nReview the durable evidence in Multica, then reply here if changes are needed."
@@ -202,19 +210,11 @@ func (n *IssueNotification) deliver(ctx context.Context, row db.IssueChannelNoti
 }
 
 func formatIssueNotificationHandoff(handoff db.GetIssueChannelNotificationHandoffRow) string {
-	if handoff.Kind == "pull_request" {
-		state := strings.TrimSpace(handoff.ResultState)
-		if state == "" {
-			state = "linked"
-		}
-		return fmt.Sprintf("Result: <%s|pull request> (%s).", handoff.Value, escapeSlackText(state))
+	state := strings.TrimSpace(handoff.ResultState)
+	if state == "" {
+		state = "linked"
 	}
-	value := strings.Join(strings.Fields(redact.Text(handoff.Value)), " ")
-	if utf8.RuneCountInString(value) > issueNotificationHandoffMaxRunes {
-		runes := []rune(value)
-		value = string(runes[:issueNotificationHandoffMaxRunes]) + "…"
-	}
-	return "Handoff: " + escapeSlackText(value)
+	return fmt.Sprintf("Result: <%s|pull request> (%s).", handoff.Value, escapeSlackText(state))
 }
 
 func findIssueNotification(ctx context.Context, client issueNotificationClient, row db.IssueChannelNotification) (string, bool, error) {
@@ -222,9 +222,10 @@ func findIssueNotification(ctx context.Context, client issueNotificationClient, 
 		return findIssueNotificationInChannel(ctx, client, row)
 	}
 	cursor := ""
-	for {
+	for page := 0; page < issueNotificationReconciliationMaxPages; page++ {
 		messages, hasMore, next, err := client.GetConversationRepliesContext(ctx, &slack.GetConversationRepliesParameters{
-			ChannelID: row.ChannelID, Timestamp: row.ThreadTs, Cursor: cursor, Limit: 100, IncludeAllMetadata: true,
+			ChannelID: row.ChannelID, Timestamp: row.ThreadTs, Cursor: cursor, Limit: 100,
+			Oldest: issueNotificationReconciliationOldest(row), IncludeAllMetadata: true,
 		})
 		if err != nil {
 			return "", false, err
@@ -239,13 +240,15 @@ func findIssueNotification(ctx context.Context, client issueNotificationClient, 
 		}
 		cursor = next
 	}
+	return "", false, errors.New("Slack issue notification reconciliation page limit reached")
 }
 
 func findIssueNotificationInChannel(ctx context.Context, client issueNotificationClient, row db.IssueChannelNotification) (string, bool, error) {
 	cursor := ""
-	for {
+	for page := 0; page < issueNotificationReconciliationMaxPages; page++ {
 		response, err := client.GetConversationHistoryContext(ctx, &slack.GetConversationHistoryParameters{
-			ChannelID: row.ChannelID, Cursor: cursor, Limit: 100, IncludeAllMetadata: true,
+			ChannelID: row.ChannelID, Cursor: cursor, Limit: 100,
+			Oldest: issueNotificationReconciliationOldest(row), IncludeAllMetadata: true,
 		})
 		if err != nil {
 			return "", false, err
@@ -260,6 +263,14 @@ func findIssueNotificationInChannel(ctx context.Context, client issueNotificatio
 			return "", false, nil
 		}
 	}
+	return "", false, errors.New("Slack issue notification reconciliation page limit reached")
+}
+
+func issueNotificationReconciliationOldest(row db.IssueChannelNotification) string {
+	if !row.CreatedAt.Valid {
+		return ""
+	}
+	return strconv.FormatFloat(float64(row.CreatedAt.Time.UnixNano())/float64(time.Second), 'f', 6, 64)
 }
 
 func issueNotificationMatches(message slack.Message, issueID pgtype.UUID) bool {

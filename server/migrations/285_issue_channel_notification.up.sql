@@ -25,6 +25,7 @@ CREATE TABLE issue_channel_notification (
     available_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     lease_token       UUID,
     lease_expires_at  TIMESTAMPTZ,
+    claim_count       INTEGER NOT NULL DEFAULT 0,
     attempts          INTEGER NOT NULL DEFAULT 0,
     reconciliation_attempts INTEGER NOT NULL DEFAULT 0,
     last_error        TEXT,
@@ -49,7 +50,7 @@ CREATE TABLE issue_channel_notification_audit (
     created_by_task_id UUID,
     installation_id    UUID NOT NULL,
     event_type         TEXT NOT NULL CHECK (event_type IN (
-        'target_created', 'queued', 'delivery_attempt', 'delivered', 'failed', 'cancelled'
+        'target_created', 'target_attached', 'queued', 'delivery_attempt', 'delivered', 'failed', 'cancelled'
     )),
     phase              TEXT,
     attempt_number     INTEGER,

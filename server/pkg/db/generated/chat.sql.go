@@ -2221,6 +2221,25 @@ func (q *Queries) LockChatSessionForEnqueue(ctx context.Context, id pgtype.UUID)
 	return i, err
 }
 
+const lockChatSessionForIssueNotification = `-- name: LockChatSessionForIssueNotification :one
+SELECT id FROM chat_session
+WHERE id = $1 AND workspace_id = $2
+FOR SHARE
+`
+
+type LockChatSessionForIssueNotificationParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+// Linearize chat archive/delete with a bounded outbound notification delivery.
+func (q *Queries) LockChatSessionForIssueNotification(ctx context.Context, arg LockChatSessionForIssueNotificationParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, lockChatSessionForIssueNotification, arg.ID, arg.WorkspaceID)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const lockChatSessionForRuntimeBind = `-- name: LockChatSessionForRuntimeBind :one
 SELECT id FROM chat_session
 WHERE id = $1

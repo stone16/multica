@@ -126,6 +126,8 @@ In a channel or DM, type:
 
 This command needs no @-mention. Multica hands the description to the agent behind the current Bot, which writes up the title and body and creates the issue. Slack first shows an acknowledgment visible only to you; when the issue is created, you get a notification in your Multica inbox.
 
+When an issue created from Slack first moves to `in_review`, Multica posts one completion notification back to its original Slack destination. Issues created from a Bot DM or @-mention reply in the originating thread. A native `/issue` command posts in the channel or DM where you ran it because Slack does not provide a source message timestamp for slash commands. A later move to `done` does not send a second success notification. If the issue is reopened after notification, Multica leaves the existing Slack message unchanged and does not send another notification when it returns to `in_review`; detailed evidence stays on the Multica issue.
+
 ## Manage connections
 
 Open **Settings → Integrations** to view all connected Slack Bots. Workspace owners and admins can disconnect them.

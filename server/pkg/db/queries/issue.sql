@@ -124,6 +124,13 @@ SELECT id FROM issue
 WHERE id = $1 AND workspace_id = $2
 FOR UPDATE;
 
+-- name: LockIssueForIssueNotification :one
+-- Linearize issue status changes and deletion with a bounded outbound
+-- notification delivery.
+SELECT id, status FROM issue
+WHERE id = $1 AND workspace_id = $2
+FOR SHARE;
+
 -- name: CreateIssue :one
 INSERT INTO issue (
     workspace_id, title, description, status, priority,

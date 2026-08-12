@@ -18,10 +18,14 @@ import (
 )
 
 type fakeIssueNotificationClient struct {
-	messages []slack.Message
-	postTS   string
-	postErr  error
-	gotForm  url.Values
+	messages     []slack.Message
+	replyPages   [][]slack.Message
+	historyPages [][]slack.Message
+	replyCalls   int
+	historyCalls int
+	postTS       string
+	postErr      error
+	gotForm      url.Values
 }
 
 type fakeIssueNotificationQueries struct {
@@ -60,12 +64,40 @@ func (f fakeIssueNotificationQueries) GetIssueChannelNotificationHandoff(context
 	return f.handoff, nil
 }
 
-func (f *fakeIssueNotificationClient) GetConversationRepliesContext(context.Context, *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error) {
-	return f.messages, false, "", nil
+func (f *fakeIssueNotificationClient) GetConversationRepliesContext(_ context.Context, params *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error) {
+	page := f.replyCalls
+	f.replyCalls++
+	if len(f.replyPages) == 0 {
+		return f.messages, false, "", nil
+	}
+	if page >= len(f.replyPages) {
+		return nil, false, "", nil
+	}
+	hasMore := page+1 < len(f.replyPages)
+	next := ""
+	if hasMore {
+		next = "reply-page-" + string(rune('2'+page))
+	}
+	return f.replyPages[page], hasMore, next, nil
 }
 
-func (f *fakeIssueNotificationClient) GetConversationHistoryContext(context.Context, *slack.GetConversationHistoryParameters) (*slack.GetConversationHistoryResponse, error) {
-	return &slack.GetConversationHistoryResponse{Messages: f.messages}, nil
+func (f *fakeIssueNotificationClient) GetConversationHistoryContext(_ context.Context, params *slack.GetConversationHistoryParameters) (*slack.GetConversationHistoryResponse, error) {
+	page := f.historyCalls
+	f.historyCalls++
+	if len(f.historyPages) == 0 {
+		return &slack.GetConversationHistoryResponse{Messages: f.messages}, nil
+	}
+	if page >= len(f.historyPages) {
+		return &slack.GetConversationHistoryResponse{}, nil
+	}
+	hasMore := page+1 < len(f.historyPages)
+	next := ""
+	if hasMore {
+		next = "history-page-" + string(rune('2'+page))
+	}
+	response := &slack.GetConversationHistoryResponse{Messages: f.historyPages[page], HasMore: hasMore}
+	response.ResponseMetaData.NextCursor = next
+	return response, nil
 }
 
 func (f *fakeIssueNotificationClient) PostMessageContext(_ context.Context, channel string, options ...slack.MsgOption) (string, string, error) {
@@ -114,6 +146,92 @@ func TestFindIssueNotification_SlashReplayFindsChannelMetadataMarker(t *testing.
 	})
 	if err != nil || !found || ts != "1700000000.9" {
 		t.Fatalf("find slash issue notification = (%q, %v, %v), want existing channel marker", ts, found, err)
+	}
+}
+
+func TestFindIssueNotification_FindsMarkerOnLaterBoundedPage(t *testing.T) {
+	issueID := pgtype.UUID{Bytes: [16]byte{1}, Valid: true}
+	client := &fakeIssueNotificationClient{replyPages: [][]slack.Message{
+		{{Msg: slack.Msg{Timestamp: "1700000000.1"}}},
+		{{Msg: slack.Msg{Timestamp: "1700000000.2"}}},
+		{{Msg: slack.Msg{
+			Timestamp: "1700000000.9",
+			Metadata: slack.SlackMetadata{
+				EventType:    issueNotificationMetadataType,
+				EventPayload: map[string]any{"notification_id": "01000000-0000-0000-0000-000000000000"},
+			},
+		}}},
+	}}
+	ts, found, err := findIssueNotification(context.Background(), client, db.IssueChannelNotification{
+		IssueID: issueID, ChannelID: "C1", ThreadTs: "1700000000.1",
+		CreatedAt: pgtype.Timestamptz{Time: time.Unix(1_700_000_000, 0), Valid: true},
+	})
+	if err != nil || !found || ts != "1700000000.9" {
+		t.Fatalf("find later-page issue notification = (%q, %v, %v)", ts, found, err)
+	}
+	if client.replyCalls != 3 {
+		t.Fatalf("reply pages read = %d, want 3", client.replyCalls)
+	}
+}
+
+func TestFindIssueNotification_ChannelFindsMarkerOnLaterBoundedPage(t *testing.T) {
+	issueID := pgtype.UUID{Bytes: [16]byte{1}, Valid: true}
+	client := &fakeIssueNotificationClient{historyPages: [][]slack.Message{
+		{{Msg: slack.Msg{Timestamp: "1700000000.1"}}},
+		{{Msg: slack.Msg{Timestamp: "1700000000.2"}}},
+		{{Msg: slack.Msg{
+			Timestamp: "1700000000.9",
+			Metadata: slack.SlackMetadata{
+				EventType:    issueNotificationMetadataType,
+				EventPayload: map[string]any{"notification_id": "01000000-0000-0000-0000-000000000000"},
+			},
+		}}},
+	}}
+	ts, found, err := findIssueNotification(context.Background(), client, db.IssueChannelNotification{
+		IssueID: issueID, ChannelID: "C1",
+		CreatedAt: pgtype.Timestamptz{Time: time.Unix(1_700_000_000, 0), Valid: true},
+	})
+	if err != nil || !found || ts != "1700000000.9" {
+		t.Fatalf("find later-page channel issue notification = (%q, %v, %v)", ts, found, err)
+	}
+	if client.historyCalls != 3 {
+		t.Fatalf("history pages read = %d, want 3", client.historyCalls)
+	}
+}
+
+func TestFindIssueNotification_BoundsBusyThreadReconciliation(t *testing.T) {
+	pages := make([][]slack.Message, issueNotificationReconciliationMaxPages+1)
+	for i := range pages {
+		pages[i] = []slack.Message{{Msg: slack.Msg{Timestamp: "1700000000.1"}}}
+	}
+	client := &fakeIssueNotificationClient{replyPages: pages}
+	_, found, err := findIssueNotification(context.Background(), client, db.IssueChannelNotification{
+		IssueID: pgtype.UUID{Bytes: [16]byte{1}, Valid: true}, ChannelID: "C1", ThreadTs: "1700000000.1",
+		CreatedAt: pgtype.Timestamptz{Time: time.Unix(1_700_000_000, 0), Valid: true},
+	})
+	if err == nil || found {
+		t.Fatalf("busy thread reconciliation = (found %v, err %v), want bounded inconclusive error", found, err)
+	}
+	if client.replyCalls != issueNotificationReconciliationMaxPages {
+		t.Fatalf("reply pages read = %d, want bound %d", client.replyCalls, issueNotificationReconciliationMaxPages)
+	}
+}
+
+func TestFindIssueNotification_BoundsBusyChannelReconciliation(t *testing.T) {
+	pages := make([][]slack.Message, issueNotificationReconciliationMaxPages+1)
+	for i := range pages {
+		pages[i] = []slack.Message{{Msg: slack.Msg{Timestamp: "1700000000.1"}}}
+	}
+	client := &fakeIssueNotificationClient{historyPages: pages}
+	_, found, err := findIssueNotification(context.Background(), client, db.IssueChannelNotification{
+		IssueID: pgtype.UUID{Bytes: [16]byte{1}, Valid: true}, ChannelID: "C1",
+		CreatedAt: pgtype.Timestamptz{Time: time.Unix(1_700_000_000, 0), Valid: true},
+	})
+	if err == nil || found {
+		t.Fatalf("busy channel reconciliation = (found %v, err %v), want bounded inconclusive error", found, err)
+	}
+	if client.historyCalls != issueNotificationReconciliationMaxPages {
+		t.Fatalf("history pages read = %d, want bound %d", client.historyCalls, issueNotificationReconciliationMaxPages)
 	}
 }
 
@@ -189,7 +307,7 @@ func TestIssueNotification_SendPostsOriginalThreadWithMetadata(t *testing.T) {
 	}, nil, "https://app.multica.test/")
 	notifier.client = func(string) issueNotificationClient { return client }
 
-	result, err := notifier.Send(context.Background(), db.IssueChannelNotification{
+	result, err := notifier.Send(context.Background(), nil, db.IssueChannelNotification{
 		IssueID: issueID, WorkspaceID: workspaceID, ChatSessionID: sessionID, InstallationID: installationID,
 		ChannelType: string(TypeSlack), ChannelAppID: "A1", ChannelTeamID: "T1", ChannelID: "C1", ThreadTs: "1700000000.1",
 	})
@@ -199,7 +317,7 @@ func TestIssueNotification_SendPostsOriginalThreadWithMetadata(t *testing.T) {
 	if client.gotForm.Get("channel") != "C1" || client.gotForm.Get("thread_ts") != "1700000000.1" {
 		t.Fatalf("posted target = channel %q thread %q", client.gotForm.Get("channel"), client.gotForm.Get("thread_ts"))
 	}
-	if got := client.gotForm.Get("text"); got != ":white_check_mark: Issue *<https://app.multica.test/support%20team/issues/CRM-42|CRM-42>* is ready for review.\nHandoff: Implemented the callback and verified the durable worker.\nReview the durable evidence in Multica, then reply here if changes are needed." {
+	if got := client.gotForm.Get("text"); got != ":white_check_mark: Issue *<https://app.multica.test/support%20team/issues/CRM-42|CRM-42>* is ready for review.\nReview the durable evidence in Multica, then reply here if changes are needed." {
 		t.Fatalf("posted text = %q", got)
 	}
 	if got := client.gotForm.Get("text"); strings.Contains(got, "jane@example.com") {
@@ -207,6 +325,39 @@ func TestIssueNotification_SendPostsOriginalThreadWithMetadata(t *testing.T) {
 	}
 	if got := client.gotForm.Get("metadata"); got != `{"event_type":"multica_issue_notification","event_payload":{"issue_id":"01000000-0000-0000-0000-000000000000","notification_id":"01000000-0000-0000-0000-000000000000"}}` {
 		t.Fatalf("posted metadata = %q", got)
+	}
+	if client.replyCalls != 0 || client.historyCalls != 0 {
+		t.Fatalf("first delivery scanned Slack history: replies=%d history=%d", client.replyCalls, client.historyCalls)
+	}
+}
+
+func TestIssueNotification_SendIncludesLinkedPullRequestOnly(t *testing.T) {
+	issueID := pgtype.UUID{Bytes: [16]byte{1}, Valid: true}
+	workspaceID := pgtype.UUID{Bytes: [16]byte{2}, Valid: true}
+	installationID := pgtype.UUID{Bytes: [16]byte{4}, Valid: true}
+	client := &fakeIssueNotificationClient{}
+	notifier := NewIssueNotification(fakeIssueNotificationQueries{
+		issue:     db.Issue{ID: issueID, Status: "in_review", Number: 42},
+		workspace: db.Workspace{IssuePrefix: "CRM", Slug: "support"},
+		installation: db.ChannelInstallation{
+			ID: installationID, WorkspaceID: workspaceID, Status: "active",
+			Config: []byte(`{"app_id":"A1","team_id":"T1","bot_token_encrypted":"eG94Yi10ZXN0"}`),
+		},
+		handoff: db.GetIssueChannelNotificationHandoffRow{
+			Kind: "pull_request", Value: "https://github.com/multica-ai/multica/pull/42", ResultState: "open",
+		},
+	}, nil, "https://app.multica.test")
+	notifier.client = func(string) issueNotificationClient { return client }
+
+	_, err := notifier.Send(context.Background(), nil, db.IssueChannelNotification{
+		IssueID: issueID, WorkspaceID: workspaceID, InstallationID: installationID,
+		ChannelType: string(TypeSlack), ChannelAppID: "A1", ChannelTeamID: "T1", ChannelID: "C1",
+	})
+	if err != nil {
+		t.Fatalf("Send linked pull request: %v", err)
+	}
+	if got := client.gotForm.Get("text"); !strings.Contains(got, "Result: <https://github.com/multica-ai/multica/pull/42|pull request> (open).") {
+		t.Fatalf("linked pull-request completion text = %q", got)
 	}
 }
 
@@ -230,7 +381,7 @@ func TestIssueNotification_ReconcileOnlyReadsMetadata(t *testing.T) {
 	}, nil, "")
 	notifier.client = func(string) issueNotificationClient { return client }
 
-	result, found, err := notifier.Reconcile(context.Background(), db.IssueChannelNotification{
+	result, found, err := notifier.Reconcile(context.Background(), nil, db.IssueChannelNotification{
 		IssueID: issueID, WorkspaceID: workspaceID, ChatSessionID: sessionID, InstallationID: installationID,
 		ChannelType: string(TypeSlack), ChannelAppID: "A1", ChannelTeamID: "T1", ChannelID: "C1", ThreadTs: "1700000000.1",
 	})
@@ -259,7 +410,7 @@ func TestIssueNotification_SendRejectsChangedBinding(t *testing.T) {
 	}, nil, "")
 	notifier.client = func(string) issueNotificationClient { return client }
 
-	_, err := notifier.Send(context.Background(), db.IssueChannelNotification{
+	_, err := notifier.Send(context.Background(), nil, db.IssueChannelNotification{
 		IssueID: issueID, WorkspaceID: workspaceID, ChatSessionID: sessionID, InstallationID: installationID,
 		ChannelType: string(TypeSlack), ChannelAppID: "A1", ChannelTeamID: "T1", ChannelID: "C1", ThreadTs: "1700000000.1",
 	})
@@ -287,7 +438,7 @@ func TestIssueNotification_SendRejectsChangedInstallationIdentity(t *testing.T) 
 	}, nil, "")
 	notifier.client = func(string) issueNotificationClient { return client }
 
-	_, err := notifier.Send(context.Background(), db.IssueChannelNotification{
+	_, err := notifier.Send(context.Background(), nil, db.IssueChannelNotification{
 		IssueID: issueID, WorkspaceID: workspaceID, InstallationID: installationID,
 		ChannelType: string(TypeSlack), ChannelAppID: "A-old", ChannelTeamID: "T-old", ChannelID: "C1",
 	})
@@ -315,7 +466,7 @@ func TestIssueNotification_SendPostsSlashCallbackAtChannelLevel(t *testing.T) {
 	}, nil, "https://app.multica.test")
 	notifier.client = func(string) issueNotificationClient { return client }
 
-	result, err := notifier.Send(context.Background(), db.IssueChannelNotification{
+	result, err := notifier.Send(context.Background(), nil, db.IssueChannelNotification{
 		IssueID: issueID, WorkspaceID: workspaceID, InstallationID: installationID,
 		ChannelType: string(TypeSlack), ChannelAppID: "A1", ChannelTeamID: "T1", ChannelID: "C-slash",
 	})
@@ -330,22 +481,11 @@ func TestIssueNotification_SendPostsSlashCallbackAtChannelLevel(t *testing.T) {
 	}
 }
 
-func TestIssueNotification_HandoffFormatsPullRequestAndRedactsBoundedComment(t *testing.T) {
+func TestIssueNotification_HandoffFormatsPullRequest(t *testing.T) {
 	pr := formatIssueNotificationHandoff(db.GetIssueChannelNotificationHandoffRow{
 		Kind: "pull_request", Value: "https://github.com/multica-ai/multica/pull/42", ResultState: "open",
 	})
 	if pr != "Result: <https://github.com/multica-ai/multica/pull/42|pull request> (open)." {
 		t.Fatalf("pull-request handoff = %q", pr)
-	}
-
-	secret := "sk-proj-abc123def456ghi789jkl012mno345"
-	comment := formatIssueNotificationHandoff(db.GetIssueChannelNotificationHandoffRow{
-		Kind: "comment", Value: secret + " " + strings.Repeat("界", issueNotificationHandoffMaxRunes+50),
-	})
-	if strings.Contains(comment, secret) || !strings.Contains(comment, "[REDACTED API KEY]") {
-		t.Fatalf("comment handoff secret redaction = %q", comment)
-	}
-	if got := []rune(strings.TrimPrefix(comment, "Handoff: ")); len(got) != issueNotificationHandoffMaxRunes+1 || got[len(got)-1] != '…' {
-		t.Fatalf("comment handoff rune length = %d, want %d plus ellipsis", len(got), issueNotificationHandoffMaxRunes)
 	}
 }

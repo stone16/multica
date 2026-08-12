@@ -126,6 +126,8 @@ Bot 只会响应明确 @ 它的频道消息。执行时，它会在权限允许�
 
 这条命令不需要 @ Bot。Multica 会把描述交给当前 Bot 对应的智能体，由它整理标题和正文并创建 issue。Slack 会先显示一条仅你可见的接收提示；创建完成后，你会在 Multica 收件箱中收到通知。
 
+从 Slack 创建的任务首次进入 `in_review` 时，Multica 会向原 Slack 位置发送一次完成通知。通过 Bot 私聊或 @mention 创建的任务会回复到原 thread；原生 `/issue` 命令则会发到执行命令的频道或私聊，因为 Slack 不会为 slash command 提供源消息时间戳。之后进入 `done` 不会重复发送成功通知。通知后重新打开任务时，Multica 会保留原 Slack 消息，不撤回、不更新，任务再次进入 `in_review` 也不会重复通知；详细证据仍保留在 Multica 任务中。
+
 ## 管理连接
 
 打开 **设置 → 集成** 可以查看所有已连接的 Slack Bot。工作区 owner 和 admin 可以断开连接。

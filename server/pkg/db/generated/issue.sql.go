@@ -1276,6 +1276,31 @@ func (q *Queries) LockIssueForDelete(ctx context.Context, arg LockIssueForDelete
 	return id, err
 }
 
+const lockIssueForIssueNotification = `-- name: LockIssueForIssueNotification :one
+SELECT id, status FROM issue
+WHERE id = $1 AND workspace_id = $2
+FOR SHARE
+`
+
+type LockIssueForIssueNotificationParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+type LockIssueForIssueNotificationRow struct {
+	ID     pgtype.UUID `json:"id"`
+	Status string      `json:"status"`
+}
+
+// Linearize issue status changes and deletion with a bounded outbound
+// notification delivery.
+func (q *Queries) LockIssueForIssueNotification(ctx context.Context, arg LockIssueForIssueNotificationParams) (LockIssueForIssueNotificationRow, error) {
+	row := q.db.QueryRow(ctx, lockIssueForIssueNotification, arg.ID, arg.WorkspaceID)
+	var i LockIssueForIssueNotificationRow
+	err := row.Scan(&i.ID, &i.Status)
+	return i, err
+}
+
 const lockIssueForUpdate = `-- name: LockIssueForUpdate :one
 SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties FROM issue
 WHERE id = $1 AND workspace_id = $2
