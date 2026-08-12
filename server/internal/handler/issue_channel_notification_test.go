@@ -545,7 +545,12 @@ func TestIssueChannelNotification_SlackSlashCommandPostsChannelCallback(t *testi
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		if r.URL.Path != "/chat.postMessage" {
+		switch r.URL.Path {
+		case "/conversations.history":
+			_, _ = w.Write([]byte(`{"ok":true,"messages":[],"has_more":false}`))
+			return
+		case "/chat.postMessage":
+		default:
 			http.Error(w, "unexpected Slack method", http.StatusNotFound)
 			return
 		}

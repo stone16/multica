@@ -64,6 +64,10 @@ func (f *fakeIssueNotificationClient) GetConversationRepliesContext(context.Cont
 	return f.messages, false, "", nil
 }
 
+func (f *fakeIssueNotificationClient) GetConversationHistoryContext(context.Context, *slack.GetConversationHistoryParameters) (*slack.GetConversationHistoryResponse, error) {
+	return &slack.GetConversationHistoryResponse{Messages: f.messages}, nil
+}
+
 func (f *fakeIssueNotificationClient) PostMessageContext(_ context.Context, channel string, options ...slack.MsgOption) (string, string, error) {
 	if f.postErr != nil {
 		return "", "", f.postErr
@@ -93,6 +97,23 @@ func TestFindIssueNotification_ReplayFindsMetadataMarker(t *testing.T) {
 	})
 	if err != nil || !found || ts != "1700000000.9" {
 		t.Fatalf("findIssueNotification = (%q, %v, %v), want existing marker", ts, found, err)
+	}
+}
+
+func TestFindIssueNotification_SlashReplayFindsChannelMetadataMarker(t *testing.T) {
+	issueID := pgtype.UUID{Bytes: [16]byte{1}, Valid: true}
+	client := &fakeIssueNotificationClient{messages: []slack.Message{{Msg: slack.Msg{
+		Timestamp: "1700000000.9",
+		Metadata: slack.SlackMetadata{
+			EventType:    issueNotificationMetadataType,
+			EventPayload: map[string]any{"notification_id": "01000000-0000-0000-0000-000000000000"},
+		},
+	}}}}
+	ts, found, err := findIssueNotification(context.Background(), client, db.IssueChannelNotification{
+		IssueID: issueID, ChannelID: "C1",
+	})
+	if err != nil || !found || ts != "1700000000.9" {
+		t.Fatalf("find slash issue notification = (%q, %v, %v), want existing channel marker", ts, found, err)
 	}
 }
 

@@ -46,6 +46,7 @@ type issueNotificationQueries interface {
 type issueNotificationClient interface {
 	PostMessageContext(context.Context, string, ...slack.MsgOption) (string, string, error)
 	GetConversationRepliesContext(context.Context, *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error)
+	GetConversationHistoryContext(context.Context, *slack.GetConversationHistoryParameters) (*slack.GetConversationHistoryResponse, error)
 }
 
 type IssueNotificationResult struct {
@@ -217,12 +218,8 @@ func formatIssueNotificationHandoff(handoff db.GetIssueChannelNotificationHandof
 }
 
 func findIssueNotification(ctx context.Context, client issueNotificationClient, row db.IssueChannelNotification) (string, bool, error) {
-	// Slack's replies API requires a thread root. Native slash-command callbacks
-	// are channel-level and therefore have no safe read-before-post
-	// reconciliation surface. Transport-level ambiguous failures still enter the
-	// worker's read-only terminal phase rather than risking a duplicate POST.
 	if row.ThreadTs == "" {
-		return "", false, nil
+		return findIssueNotificationInChannel(ctx, client, row)
 	}
 	cursor := ""
 	for {
@@ -233,10 +230,7 @@ func findIssueNotification(ctx context.Context, client issueNotificationClient, 
 			return "", false, err
 		}
 		for _, message := range messages {
-			if message.Metadata.EventType != issueNotificationMetadataType {
-				continue
-			}
-			if fmt.Sprint(message.Metadata.EventPayload["notification_id"]) == util.UUIDToString(row.IssueID) {
+			if issueNotificationMatches(message, row.IssueID) {
 				return message.Timestamp, true, nil
 			}
 		}
@@ -245,6 +239,32 @@ func findIssueNotification(ctx context.Context, client issueNotificationClient, 
 		}
 		cursor = next
 	}
+}
+
+func findIssueNotificationInChannel(ctx context.Context, client issueNotificationClient, row db.IssueChannelNotification) (string, bool, error) {
+	cursor := ""
+	for {
+		response, err := client.GetConversationHistoryContext(ctx, &slack.GetConversationHistoryParameters{
+			ChannelID: row.ChannelID, Cursor: cursor, Limit: 100, IncludeAllMetadata: true,
+		})
+		if err != nil {
+			return "", false, err
+		}
+		for _, message := range response.Messages {
+			if issueNotificationMatches(message, row.IssueID) {
+				return message.Timestamp, true, nil
+			}
+		}
+		cursor = response.ResponseMetaData.NextCursor
+		if !response.HasMore || cursor == "" {
+			return "", false, nil
+		}
+	}
+}
+
+func issueNotificationMatches(message slack.Message, issueID pgtype.UUID) bool {
+	return message.Metadata.EventType == issueNotificationMetadataType &&
+		fmt.Sprint(message.Metadata.EventPayload["notification_id"]) == util.UUIDToString(issueID)
 }
 
 func escapeSlackText(value string) string {
