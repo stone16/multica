@@ -581,4 +581,14 @@ func TestIssueChannelNotification_SlackSlashCommandPostsChannelCallback(t *testi
 	if notificationStatus != "delivered" {
 		t.Fatalf("slash notification status = %q, want delivered", notificationStatus)
 	}
+	var attachedAuditCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*) FROM issue_channel_notification_audit
+		WHERE issue_id = $1 AND created_by_task_id = $2
+	`, created.ID, taskID).Scan(&attachedAuditCount); err != nil {
+		t.Fatalf("load attached slash notification audit: %v", err)
+	}
+	if attachedAuditCount != 4 {
+		t.Fatalf("attached slash notification audit rows = %d, want target/queue/attempt/delivery", attachedAuditCount)
+	}
 }

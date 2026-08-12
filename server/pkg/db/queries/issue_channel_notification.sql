@@ -63,6 +63,14 @@ WITH RECURSIVE task_lineage AS (
       AND n.workspace_id = sqlc.arg('workspace_id')::uuid
       AND n.issue_id IS NULL
     RETURNING n.*
+), attached_slash_audit AS (
+    UPDATE issue_channel_notification_audit audit
+    SET issue_id = attached.issue_id
+    FROM attached_slash attached
+    WHERE audit.workspace_id = attached.workspace_id
+      AND audit.created_by_task_id = attached.created_by_task_id
+      AND audit.issue_id IS NULL
+    RETURNING audit.id
 ), origin_message AS (
     SELECT root.id AS created_by_task_id,
            COALESCE(root.initiator_user_id, root.originator_user_id) AS initiator_user_id,
@@ -296,19 +304,8 @@ WHERE issue_id = sqlc.arg('issue_id')
 RETURNING *;
 
 -- name: DeliverClaimedIssueChannelNotification :one
-WITH audited AS (
-    INSERT INTO issue_channel_notification_audit (
-        issue_id, workspace_id, created_by_task_id, installation_id,
-        event_type, phase, attempt_number, slack_message_ts
-    )
-    SELECT issue_id, workspace_id, created_by_task_id, installation_id,
-           'delivered', 'send', attempts + 1, sqlc.arg('slack_message_ts')
-    FROM issue_channel_notification
-    WHERE issue_id = sqlc.arg('issue_id')
-      AND lease_token = sqlc.arg('lease_token')
-      AND status = 'queued'
-)
-UPDATE issue_channel_notification AS n
+WITH delivered AS (
+    UPDATE issue_channel_notification AS n
     SET status = 'delivered',
         attempts = attempts + 1,
         last_error = NULL,
@@ -320,48 +317,46 @@ UPDATE issue_channel_notification AS n
     WHERE n.issue_id = sqlc.arg('issue_id')
       AND n.lease_token = sqlc.arg('lease_token')
       AND n.status = 'queued'
-RETURNING n.*;
+    RETURNING n.*
+), audited AS (
+    INSERT INTO issue_channel_notification_audit (
+        issue_id, workspace_id, created_by_task_id, installation_id,
+        event_type, phase, attempt_number, slack_message_ts
+    )
+    SELECT issue_id, workspace_id, created_by_task_id, installation_id,
+           'delivered', 'send', attempts, slack_message_ts
+    FROM delivered
+)
+SELECT issue_id FROM delivered;
 
 -- name: DeliverReconcilingIssueChannelNotification :one
-WITH audited AS (
+WITH delivered AS (
+    UPDATE issue_channel_notification AS n
+    SET status = 'delivered',
+        last_error = NULL,
+        slack_message_ts = sqlc.arg('slack_message_ts'),
+        delivered_at = now(),
+        lease_token = NULL,
+        lease_expires_at = NULL,
+        updated_at = now()
+    WHERE n.issue_id = sqlc.arg('issue_id')
+      AND n.lease_token = sqlc.arg('lease_token')
+      AND n.status = 'reconciling'
+    RETURNING n.*
+), audited AS (
     INSERT INTO issue_channel_notification_audit (
         issue_id, workspace_id, created_by_task_id, installation_id,
         event_type, phase, attempt_number, slack_message_ts
     )
     SELECT issue_id, workspace_id, created_by_task_id, installation_id,
            'delivered', 'reconcile', reconciliation_attempts + 1, sqlc.arg('slack_message_ts')
-    FROM issue_channel_notification
-    WHERE issue_id = sqlc.arg('issue_id')
-      AND lease_token = sqlc.arg('lease_token')
-      AND status = 'reconciling'
+    FROM delivered
 )
-UPDATE issue_channel_notification AS n
-    SET status = 'delivered',
-        last_error = NULL,
-        slack_message_ts = sqlc.arg('slack_message_ts'),
-        delivered_at = now(),
-        lease_token = NULL,
-        lease_expires_at = NULL,
-        updated_at = now()
-    WHERE n.issue_id = sqlc.arg('issue_id')
-      AND n.lease_token = sqlc.arg('lease_token')
-      AND n.status = 'reconciling'
-RETURNING n.*;
+SELECT issue_id FROM delivered;
 
 -- name: FailClaimedIssueChannelNotification :one
-WITH audited AS (
-    INSERT INTO issue_channel_notification_audit (
-        issue_id, workspace_id, created_by_task_id, installation_id,
-        event_type, phase, attempt_number, error
-    )
-    SELECT issue_id, workspace_id, created_by_task_id, installation_id,
-           'failed', 'send', attempts + 1, sqlc.arg('last_error')
-    FROM issue_channel_notification
-    WHERE issue_id = sqlc.arg('issue_id')
-      AND lease_token = sqlc.arg('lease_token')
-      AND status = 'queued'
-)
-UPDATE issue_channel_notification AS n
+WITH failed AS (
+    UPDATE issue_channel_notification AS n
     SET status = 'failed',
         attempts = attempts + 1,
         last_error = sqlc.arg('last_error'),
@@ -372,22 +367,21 @@ UPDATE issue_channel_notification AS n
     WHERE n.issue_id = sqlc.arg('issue_id')
       AND n.lease_token = sqlc.arg('lease_token')
       AND n.status = 'queued'
-RETURNING n.*;
-
--- name: FailReconcilingIssueChannelNotification :one
-WITH audited AS (
+    RETURNING n.*
+), audited AS (
     INSERT INTO issue_channel_notification_audit (
         issue_id, workspace_id, created_by_task_id, installation_id,
         event_type, phase, attempt_number, error
     )
     SELECT issue_id, workspace_id, created_by_task_id, installation_id,
-           'failed', 'reconcile', reconciliation_attempts + 1, sqlc.arg('last_error')
-    FROM issue_channel_notification
-    WHERE issue_id = sqlc.arg('issue_id')
-      AND lease_token = sqlc.arg('lease_token')
-      AND status = 'reconciling'
+           'failed', 'send', attempts, last_error
+    FROM failed
 )
-UPDATE issue_channel_notification AS n
+SELECT issue_id FROM failed;
+
+-- name: FailReconcilingIssueChannelNotification :one
+WITH failed AS (
+    UPDATE issue_channel_notification AS n
     SET status = 'failed',
         last_error = sqlc.arg('last_error'),
         failed_at = now(),
@@ -397,7 +391,17 @@ UPDATE issue_channel_notification AS n
     WHERE n.issue_id = sqlc.arg('issue_id')
       AND n.lease_token = sqlc.arg('lease_token')
       AND n.status = 'reconciling'
-RETURNING n.*;
+    RETURNING n.*
+), audited AS (
+    INSERT INTO issue_channel_notification_audit (
+        issue_id, workspace_id, created_by_task_id, installation_id,
+        event_type, phase, attempt_number, error
+    )
+    SELECT issue_id, workspace_id, created_by_task_id, installation_id,
+           'failed', 'reconcile', reconciliation_attempts + 1, last_error
+    FROM failed
+)
+SELECT issue_id FROM failed;
 
 -- name: CancelIssueChannelNotificationsByInstallation :exec
 WITH cancelled AS (

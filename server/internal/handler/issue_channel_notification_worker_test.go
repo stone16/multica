@@ -37,13 +37,13 @@ func (f *fakeIssueChannelNotificationQueries) DeferClaimedIssueChannelNotificati
 	f.deferred = p
 	return f.row, nil
 }
-func (f *fakeIssueChannelNotificationQueries) DeliverClaimedIssueChannelNotification(_ context.Context, p db.DeliverClaimedIssueChannelNotificationParams) (db.IssueChannelNotification, error) {
+func (f *fakeIssueChannelNotificationQueries) DeliverClaimedIssueChannelNotification(_ context.Context, p db.DeliverClaimedIssueChannelNotificationParams) (pgtype.UUID, error) {
 	f.delivered = p
-	return f.row, nil
+	return f.row.IssueID, nil
 }
-func (f *fakeIssueChannelNotificationQueries) FailClaimedIssueChannelNotification(_ context.Context, p db.FailClaimedIssueChannelNotificationParams) (db.IssueChannelNotification, error) {
+func (f *fakeIssueChannelNotificationQueries) FailClaimedIssueChannelNotification(_ context.Context, p db.FailClaimedIssueChannelNotificationParams) (pgtype.UUID, error) {
 	f.failed = p
-	return f.row, nil
+	return f.row.IssueID, nil
 }
 func (f *fakeIssueChannelNotificationQueries) RetryClaimedIssueChannelNotification(_ context.Context, p db.RetryClaimedIssueChannelNotificationParams) (db.IssueChannelNotification, error) {
 	f.retried = p
@@ -57,13 +57,13 @@ func (f *fakeIssueChannelNotificationQueries) RetryReconcilingIssueChannelNotifi
 	f.retryReconcile = p
 	return f.row, nil
 }
-func (f *fakeIssueChannelNotificationQueries) DeliverReconcilingIssueChannelNotification(_ context.Context, p db.DeliverReconcilingIssueChannelNotificationParams) (db.IssueChannelNotification, error) {
+func (f *fakeIssueChannelNotificationQueries) DeliverReconcilingIssueChannelNotification(_ context.Context, p db.DeliverReconcilingIssueChannelNotificationParams) (pgtype.UUID, error) {
 	f.deliveredReconcile = p
-	return f.row, nil
+	return f.row.IssueID, nil
 }
-func (f *fakeIssueChannelNotificationQueries) FailReconcilingIssueChannelNotification(_ context.Context, p db.FailReconcilingIssueChannelNotificationParams) (db.IssueChannelNotification, error) {
+func (f *fakeIssueChannelNotificationQueries) FailReconcilingIssueChannelNotification(_ context.Context, p db.FailReconcilingIssueChannelNotificationParams) (pgtype.UUID, error) {
 	f.failedReconcile = p
-	return f.row, nil
+	return f.row.IssueID, nil
 }
 
 type errorIssueChannelNotificationSender struct{ err error }

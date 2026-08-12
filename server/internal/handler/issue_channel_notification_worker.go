@@ -33,13 +33,13 @@ type issueChannelNotificationQueries interface {
 	ClaimQueuedIssueChannelNotification(context.Context) (db.IssueChannelNotification, error)
 	AuditClaimedIssueChannelNotificationAttempt(context.Context, db.AuditClaimedIssueChannelNotificationAttemptParams) (pgtype.UUID, error)
 	DeferClaimedIssueChannelNotification(context.Context, db.DeferClaimedIssueChannelNotificationParams) (db.IssueChannelNotification, error)
-	DeliverClaimedIssueChannelNotification(context.Context, db.DeliverClaimedIssueChannelNotificationParams) (db.IssueChannelNotification, error)
-	FailClaimedIssueChannelNotification(context.Context, db.FailClaimedIssueChannelNotificationParams) (db.IssueChannelNotification, error)
+	DeliverClaimedIssueChannelNotification(context.Context, db.DeliverClaimedIssueChannelNotificationParams) (pgtype.UUID, error)
+	FailClaimedIssueChannelNotification(context.Context, db.FailClaimedIssueChannelNotificationParams) (pgtype.UUID, error)
 	RetryClaimedIssueChannelNotification(context.Context, db.RetryClaimedIssueChannelNotificationParams) (db.IssueChannelNotification, error)
 	ReconcileClaimedIssueChannelNotification(context.Context, db.ReconcileClaimedIssueChannelNotificationParams) (db.IssueChannelNotification, error)
 	RetryReconcilingIssueChannelNotification(context.Context, db.RetryReconcilingIssueChannelNotificationParams) (db.IssueChannelNotification, error)
-	DeliverReconcilingIssueChannelNotification(context.Context, db.DeliverReconcilingIssueChannelNotificationParams) (db.IssueChannelNotification, error)
-	FailReconcilingIssueChannelNotification(context.Context, db.FailReconcilingIssueChannelNotificationParams) (db.IssueChannelNotification, error)
+	DeliverReconcilingIssueChannelNotification(context.Context, db.DeliverReconcilingIssueChannelNotificationParams) (pgtype.UUID, error)
+	FailReconcilingIssueChannelNotification(context.Context, db.FailReconcilingIssueChannelNotificationParams) (pgtype.UUID, error)
 }
 
 // IssueChannelNotificationWorker owns the durable issue-to-channel delivery
