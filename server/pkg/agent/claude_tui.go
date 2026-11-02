@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -187,8 +188,10 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 	cfgDir, _ := claudeConfigDir(cmd.Env, opts.Cwd)
 	var mu sync.Mutex
 	var screen strings.Builder
+	var bracketedPasteSeen bool
 	var pasted, entered bool
 	var trustSent, trustAccepted bool
+	trustMoves := 0
 	var trustSince time.Time
 	var enterAt time.Time
 	var promptRows int
@@ -252,8 +255,12 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				ptyBytes = nil
 				continue
 			}
+			respondTUIQueries(master, chunk)
 			mu.Lock()
 			screen.Write(chunk)
+			if bytes.Contains(chunk, []byte("\x1b[?2004h")) {
+				bracketedPasteSeen = true
+			}
 			if screen.Len() > 128<<10 {
 				s := screen.String()
 				screen.Reset()
@@ -268,16 +275,12 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				return r
 			}, s)
 			trust := !trustAccepted && strings.Contains(compact, "No,exit") && strings.Contains(compact, "Yes,Itrustthisfolder")
-			ready := (!trust || trustAccepted) && strings.Contains(s, "❯") && strings.Contains(rawScreen, "\x1b[?2004h")
+			ready := (!trust || trustAccepted) && !strings.Contains(compact, "No,exit") && !strings.Contains(compact, "Yes,Itrustthisfolder") && strings.Contains(s, "❯") && bracketedPasteSeen
 			if trust && !trustSent {
 				_, _ = master.Write([]byte("\x1b[B"))
 				trustSent = true
+				trustMoves = 1
 				trustSince = time.Now()
-			}
-			if trust && !pasted && !trustSince.IsZero() && time.Since(trustSince) > 300*time.Millisecond && strings.Contains(s, "Yes, I trust this folder") {
-				_, _ = master.Write([]byte("\r"))
-				trustAccepted = true
-				trustSince = time.Time{}
 			}
 			if ready && !pasted {
 				clean := tuiPasteText(prompt)
@@ -299,10 +302,19 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				}
 				return r
 			}, tuiScreenText(screen.String()))
-			if trustSent && !trustAccepted && !trustSince.IsZero() && time.Since(trustSince) > 300*time.Millisecond && strings.Contains(compact, "Yes,Itrustthisfolder") {
-				_, _ = master.Write([]byte("\r"))
-				trustAccepted = true
-				trustSince = time.Time{}
+			if trustSent && !trustAccepted && !trustSince.IsZero() && time.Since(trustSince) > 300*time.Millisecond {
+				if trustMoves == 1 {
+					// Claude can repaint the modal after the first Down and restore
+					// the No selection; repeat once before committing the choice.
+					_, _ = master.Write([]byte("\x1b[B"))
+					trustMoves = 2
+					trustSince = time.Now()
+				} else if trustMoves == 2 && strings.Contains(compact, "Yes,Itrustthisfolder") {
+					_, _ = master.Write([]byte("\r"))
+					trustAccepted = true
+					trustSince = time.Time{}
+					screen.Reset()
+				}
 			}
 			mu.Unlock()
 			if err := b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd); err != nil && finalErr == "" {
@@ -346,6 +358,18 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			results <- Result{Status: status, Output: finalText, Error: finalErr, SessionID: sessionID, Usage: usage}
 			return
 		}
+	}
+}
+
+// respondTUIQueries answers the device-status queries Claude uses to finish
+// terminal setup. A PTY without these replies can exit immediately after the
+// trust screen even though the process and login are otherwise healthy.
+func respondTUIQueries(master *os.File, chunk []byte) {
+	if bytes.Contains(chunk, []byte("\x1b[c")) || bytes.Contains(chunk, []byte("\x1b[0c")) {
+		_, _ = master.Write([]byte("\x1b[?62;c"))
+	}
+	if bytes.Contains(chunk, []byte("\x1b[6n")) {
+		_, _ = master.Write([]byte("\x1b[1;1R"))
 	}
 }
 
