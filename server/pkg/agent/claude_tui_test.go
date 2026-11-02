@@ -280,6 +280,36 @@ func TestClaudeTUIOwnedCwdProcessesFindsChildAfterLeaderExit(t *testing.T) {
 	t.Fatal("owned cwd sweep did not terminate the child before the leader exited")
 }
 
+func TestClaudeTUISignalOwnedSkipsUnownedCwd(t *testing.T) {
+	root := t.TempDir()
+	childFile := filepath.Join(root, "child.pid")
+	cmd := exec.Command("/bin/sh", "-c", fmt.Sprintf("sleep 60 & echo $! > %q; wait", childFile))
+	cmd.Dir = root
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var childPID int
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+		if data, err := os.ReadFile(childFile); err == nil {
+			_, _ = fmt.Sscan(string(data), &childPID)
+			if childPID > 0 {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if childPID == 0 {
+		t.Fatal("child pid was not written")
+	}
+	claudeTUISignalOwned(cmd, ExecOptions{Cwd: root, CwdOwnedByDaemon: false}, syscall.SIGTERM)
+	if err := syscall.Kill(childPID, 0); err != nil {
+		t.Fatalf("unowned cwd child was signaled: %v", err)
+	}
+	_ = syscall.Kill(childPID, syscall.SIGKILL)
+	_ = cmd.Wait()
+}
+
 func TestClaudeTUIScreenTextRemovesCursorMoves(t *testing.T) {
 	raw := "\x1b[2GNo, exit\r\n\x1b[4GYes,\x1b[9GI\x1b[11Gtrust\x1b[17Gthis\x1b[22Gfolder"
 	got := tuiScreenText(raw)

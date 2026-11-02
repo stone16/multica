@@ -292,6 +292,10 @@ type Environment struct {
 	// scratch that the GC should reclaim on the normal schedule, and the
 	// sidecar rollback that protects a user's directory is unnecessary.
 	LocalDirectory bool
+	// CwdOwnedByDaemon is the explicit ownership fact for process cleanup.
+	// It is false for user-supplied local_directory paths and true for the
+	// disposable workdir the daemon created (including daemon git worktrees).
+	CwdOwnedByDaemon bool
 	// MulticaConfigRoot is the private per-task config directory exported to
 	// child CLI invocations. It prevents implicit discovery of the daemon
 	// owner's ~/.multica profile without changing the provider-facing HOME.
@@ -566,6 +570,7 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 		RootDir:           envRoot,
 		WorkDir:           workDir,
 		LocalDirectory:    params.LocalWorkDir != "",
+		CwdOwnedByDaemon:  params.LocalWorkDir == "",
 		LocalWorktree:     localWorktree,
 		MulticaConfigRoot: multicaConfigRoot,
 		logger:            logger,
@@ -853,10 +858,11 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 		rootDir = ""
 	}
 	env := &Environment{
-		RootDir:        rootDir,
-		WorkDir:        params.WorkDir,
-		LocalDirectory: params.LocalDirectory,
-		logger:         logger,
+		RootDir:          rootDir,
+		WorkDir:          params.WorkDir,
+		LocalDirectory:   params.LocalDirectory,
+		CwdOwnedByDaemon: !params.LocalDirectory,
+		logger:           logger,
 	}
 	if env.RootDir != "" {
 		env.MulticaConfigRoot = filepath.Join(env.RootDir, "multica-config")
