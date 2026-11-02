@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 )
@@ -187,6 +188,8 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 	var mu sync.Mutex
 	var screen strings.Builder
 	var pasted, entered bool
+	var trustSent, trustAccepted bool
+	var trustSince time.Time
 	var enterAt time.Time
 	var promptRows int
 	var finalText string
@@ -256,16 +259,25 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				screen.Reset()
 				screen.WriteString(s[len(s)-64<<10:])
 			}
-			s := screen.String()
-			trust := strings.Contains(s, "No, exit") && strings.Contains(s, "Yes, I trust this folder")
-			ready := strings.Contains(s, "❯\u00a0") && strings.Contains(s, "\x1b[?2004h")
-			if trust && !pasted {
+			rawScreen := screen.String()
+			s := tuiScreenText(rawScreen)
+			compact := strings.Map(func(r rune) rune {
+				if unicode.IsSpace(r) {
+					return -1
+				}
+				return r
+			}, s)
+			trust := !trustAccepted && strings.Contains(compact, "No,exit") && strings.Contains(compact, "Yes,Itrustthisfolder")
+			ready := (!trust || trustAccepted) && strings.Contains(s, "❯") && strings.Contains(rawScreen, "\x1b[?2004h")
+			if trust && !trustSent {
 				_, _ = master.Write([]byte("\x1b[B"))
-				waitStart = time.Now()
+				trustSent = true
+				trustSince = time.Now()
 			}
-			if trust && !pasted && !waitStart.IsZero() && time.Since(waitStart) > 300*time.Millisecond && strings.Contains(s, "❯ Yes, I trust") {
+			if trust && !pasted && !trustSince.IsZero() && time.Since(trustSince) > 300*time.Millisecond && strings.Contains(s, "Yes, I trust this folder") {
 				_, _ = master.Write([]byte("\r"))
-				waitStart = time.Time{}
+				trustAccepted = true
+				trustSince = time.Time{}
 			}
 			if ready && !pasted {
 				clean := tuiPasteText(prompt)
@@ -280,6 +292,19 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			}
 			mu.Unlock()
 		case <-ticker.C:
+			mu.Lock()
+			compact := strings.Map(func(r rune) rune {
+				if unicode.IsSpace(r) {
+					return -1
+				}
+				return r
+			}, tuiScreenText(screen.String()))
+			if trustSent && !trustAccepted && !trustSince.IsZero() && time.Since(trustSince) > 300*time.Millisecond && strings.Contains(compact, "Yes,Itrustthisfolder") {
+				_, _ = master.Write([]byte("\r"))
+				trustAccepted = true
+				trustSince = time.Time{}
+			}
+			mu.Unlock()
 			if err := b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd); err != nil && finalErr == "" {
 				finalErr = err.Error()
 			}
@@ -322,6 +347,45 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			return
 		}
 	}
+}
+
+// tuiScreenText removes cursor movement and OSC/CSI control sequences while
+// retaining the text that Claude renders between them for modal matching.
+func tuiScreenText(raw string) string {
+	var b strings.Builder
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != 0x1b {
+			if raw[i] >= 0x20 || raw[i] == '\n' || raw[i] == '\r' || raw[i] == '\t' {
+				b.WriteByte(raw[i])
+			}
+			continue
+		}
+		i++
+		if i >= len(raw) {
+			break
+		}
+		if raw[i] == ']' {
+			for i+1 < len(raw) {
+				i++
+				if raw[i] == 0x07 || (raw[i] == 0x1b && i+1 < len(raw) && raw[i+1] == '\\') {
+					if raw[i] == 0x1b {
+						i++
+					}
+					break
+				}
+			}
+			continue
+		}
+		if raw[i] == '[' {
+			for i+1 < len(raw) {
+				i++
+				if raw[i] >= 0x40 && raw[i] <= 0x7e {
+					break
+				}
+			}
+		}
+	}
+	return b.String()
 }
 
 func tuiPasteText(prompt string) string {

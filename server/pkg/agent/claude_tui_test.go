@@ -3,6 +3,7 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -171,5 +172,13 @@ func TestClaudeModeFactoryIsOptIn(t *testing.T) {
 func TestClaudeTUIPathWithin(t *testing.T) {
 	if !pathWithin("/task/work/sub", "/task/work") || pathWithin("/task/worker", "/task/work") || pathWithin("/other", "/task/work") {
 		t.Fatal("pathWithin ownership boundary incorrect")
+	}
+}
+
+func TestClaudeTUIScreenTextRemovesCursorMoves(t *testing.T) {
+	raw := "\x1b[2GNo, exit\r\n\x1b[4GYes,\x1b[9GI\x1b[11Gtrust\x1b[17Gthis\x1b[22Gfolder"
+	got := tuiScreenText(raw)
+	if !strings.Contains(got, "No, exit") || !strings.Contains(got, "Yes,Itrustthisfolder") {
+		t.Fatalf("screen text = %q", got)
 	}
 }
