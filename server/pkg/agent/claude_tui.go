@@ -578,8 +578,8 @@ func claudeTUISignal(cmd *exec.Cmd, sig syscall.Signal) {
 func claudeTUISignalOwned(cmd *exec.Cmd, opts ExecOptions, sig syscall.Signal) {
 	var groups []int
 	if opts.CwdOwnedByDaemon && opts.Cwd != "" && (runtime.GOOS == "darwin" || runtime.GOOS == "linux") {
-		// Capture cwd-owned groups before signalling Claude: the leader may exit
-		// immediately, leaving a tool child reparented under PID 1.
+		// Capture descendants before signalling Claude; the leader may exit
+		// immediately and lose the parent relationship.
 		groups = claudeTUIOwnedCwdProcesses(cmd, opts.Cwd)
 	}
 	claudeTUISignal(cmd, sig)
@@ -591,10 +591,11 @@ func claudeTUISignalOwned(cmd *exec.Cmd, opts ExecOptions, sig syscall.Signal) {
 	}
 }
 
-// claudeTUIOwnedCwdProcesses finds processes in the daemon-owned task cwd
-// that remain in Claude's session. A child that creates a new session is
-// intentionally skipped because ownership is no longer provable.
+// claudeTUIOwnedCwdProcesses finds Claude's descendants before the leader is
+// signalled. The explicit daemon-owned bit proves that this process tree is
+// ours; local-directory tasks never call this helper.
 func claudeTUIOwnedCwdProcesses(cmd *exec.Cmd, root string) []int {
+	_ = root
 	sessionColumn := "sid="
 	if runtime.GOOS == "darwin" {
 		sessionColumn = "sess="
@@ -618,83 +619,31 @@ func claudeTUIOwnedCwdProcesses(cmd *exec.Cmd, root string) []int {
 		}
 		rows = append(rows, claudeTUIProc{pid: pid, ppid: ppid, pgid: pgid, sid: sid})
 	}
-	var pids []int
-	var cwdByPID map[int]string
-	if runtime.GOOS == "darwin" {
-		cwdByPID = claudeTUIProcessCwds(rows)
+	owned := map[int]bool{cmd.Process.Pid: true}
+	for changed := true; changed; {
+		changed = false
+		for _, row := range rows {
+			if owned[row.ppid] && !owned[row.pid] {
+				owned[row.pid] = true
+				changed = true
+			}
+		}
 	}
+	groups := make(map[int]struct{})
 	for _, row := range rows {
-		// A daemon-owned task workdir is unique to this run, so cwd is the
-		// ownership proof even after Claude exits and its child is reparented.
-		// Local-directory tasks never call this helper because their cwd is user-owned.
-		if row.pid == os.Getpid() || row.pid == cmd.Process.Pid || row.pgid <= 1 {
+		if !owned[row.pid] || row.pid == os.Getpid() || row.pid == cmd.Process.Pid || row.pgid <= 1 {
 			continue
 		}
-		cwd, ok := "", false
-		if cwdByPID != nil {
-			cwd, ok = cwdByPID[row.pid]
-		} else {
-			cwd, ok = claudeTUIProcessCwd(row.pid)
-		}
-		if ok && pathWithin(cwd, root) {
-			pids = append(pids, row.pgid)
-		}
+		groups[row.pgid] = struct{}{}
+	}
+	pids := make([]int, 0, len(groups))
+	for pgid := range groups {
+		pids = append(pids, pgid)
 	}
 	return pids
 }
 
 type claudeTUIProc struct{ pid, ppid, pgid, sid int }
-
-func claudeTUIProcessCwds(rows []claudeTUIProc) map[int]string {
-	if len(rows) == 0 {
-		return nil
-	}
-	result := make(map[int]string)
-	for start := 0; start < len(rows); start += 128 {
-		end := start + 128
-		if end > len(rows) {
-			end = len(rows)
-		}
-		pids := make([]string, 0, end-start)
-		for _, row := range rows[start:end] {
-			pids = append(pids, strconv.Itoa(row.pid))
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		out, err := exec.CommandContext(ctx, "lsof", "-b", "-a", "-d", "cwd", "-Fn", "-p", strings.Join(pids, ",")).Output()
-		cancel()
-		if err != nil {
-			continue
-		}
-		pid := 0
-		for _, line := range strings.Split(string(out), "\n") {
-			if strings.HasPrefix(line, "p") {
-				pid, _ = strconv.Atoi(strings.TrimPrefix(line, "p"))
-			} else if strings.HasPrefix(line, "n") && pid > 0 {
-				result[pid] = strings.TrimPrefix(line, "n")
-			}
-		}
-	}
-	return result
-}
-
-func claudeTUIProcessCwd(pid int) (string, bool) {
-	if runtime.GOOS == "linux" {
-		cwd, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "cwd"))
-		return cwd, err == nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "lsof", "-b", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn").Output()
-	if err != nil {
-		return "", false
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if strings.HasPrefix(line, "n") {
-			return strings.TrimPrefix(line, "n"), true
-		}
-	}
-	return "", false
-}
 
 func pathWithin(path, root string) bool {
 	rel, err := filepath.Rel(root, path)
