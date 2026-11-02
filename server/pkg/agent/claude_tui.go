@@ -353,6 +353,15 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			_ = master.Close()
 			waitClaudeTUIRead(readDone)
 			_ = b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, usageBaseline, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd)
+			if terminal.Load() {
+				status := "completed"
+				if finalErr != "" {
+					status = "failed"
+				}
+				resultSession, rejected := tuiResultSession(opts, sessionID, status == "failed", promptRows, finalErr)
+				results <- Result{Status: status, Output: finalText, Error: finalErr, SessionID: resultSession, ResumeRejected: rejected, Usage: usage}
+				return
+			}
 			emittedSession := ""
 			if promptRows > 0 {
 				emittedSession = sessionID
@@ -991,6 +1000,18 @@ func (b *claudeTUIBackend) processTUIRow(raw map[string]any, ch chan<- Message, 
 			}
 		}
 		apiError := isAPIErrorRow(raw)
+		if id != "" && !apiError {
+			marker := "final:" + id
+			if _, exists := seen[marker]; !exists {
+				for key := range seen {
+					if strings.HasPrefix(key, "final:") {
+						delete(seen, key)
+					}
+				}
+				seen[marker] = struct{}{}
+				*finalText = ""
+			}
+		}
 		blocks, _ := msg["content"].([]any)
 		for _, x := range blocks {
 			bmap, _ := x.(map[string]any)

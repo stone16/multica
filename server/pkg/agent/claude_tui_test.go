@@ -216,6 +216,24 @@ func TestClaudeTUIMessageIDKeepsBlocksAndDeduplicatesUsage(t *testing.T) {
 	}
 }
 
+func TestClaudeTUIOutputUsesLatestAssistantMessage(t *testing.T) {
+	backend := &claudeTUIBackend{}
+	ch := make(chan Message, 4)
+	finalText, finalErr, reason := "", "", ""
+	sawResult, rows := false, 1
+	seen := map[string]struct{}{}
+	usage := map[string]TokenUsage{}
+	row := func(id, text string) map[string]any {
+		return map[string]any{"type": "assistant", "message": map[string]any{"id": id, "content": []any{map[string]any{"type": "text", "text": text}}}}
+	}
+	backend.processTUIRow(row("narration", "NARRATION"), ch, usage, nil, seen, &finalText, &finalErr, &sawResult, &reason, &rows, "session", "")
+	backend.processTUIRow(row("final", "FINAL"), ch, usage, nil, seen, &finalText, &finalErr, &sawResult, &reason, &rows, "session", "")
+	close(ch)
+	if finalText != "FINAL" {
+		t.Fatalf("final text = %q, want latest assistant message", finalText)
+	}
+}
+
 func TestClaudeTUISettingsMergePreservesDeny(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "settings.json")
 	if err := os.WriteFile(path, []byte(`{"permissions":{"deny":["Skill(secret)"]},"skillOverrides":{"secret":"off"}}`), 0o600); err != nil {
