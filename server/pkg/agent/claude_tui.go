@@ -505,8 +505,10 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				// Claude can leave the interactive shell alive after writing its
 				// terminal transcript row. Signal the owned process group directly
 				// so Result also acknowledges bounded cleanup.
-				cleanupGroups, cleanupIdentities = claudeTUIOwnedProcessGroups(cmd)
-				claudeTUISignalCaptured(cmd, cleanupGroups, cleanupIdentities, syscall.SIGTERM, rootStart)
+				if rootStart == 0 || claudeTUIRootMatches(cmd, rootStart) {
+					cleanupGroups, cleanupIdentities = claudeTUIOwnedProcessGroups(cmd)
+					claudeTUISignalCaptured(cmd, cleanupGroups, cleanupIdentities, syscall.SIGTERM, rootStart)
+				}
 				cleanupStarted = true
 				cleanupAt = time.Now()
 			}
@@ -730,6 +732,9 @@ func claudeTUISignalCaptured(cmd *exec.Cmd, groups []int, identities map[int]map
 
 func claudeTUIStop(cmd *exec.Cmd, opts ExecOptions, procDone <-chan struct{}, expectedStart uint64) {
 	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	if expectedStart != 0 && !claudeTUIRootMatches(cmd, expectedStart) {
 		return
 	}
 	groups, identities := claudeTUIOwnedProcessGroups(cmd)
