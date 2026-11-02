@@ -398,7 +398,7 @@ func claudeTUIOwnedCwdProcesses(cmd *exec.Cmd, root string) []int {
 	}
 	var pids []int
 	for _, row := range rows {
-		if strconv.Itoa(row.sid) != ownSID || row.pid == os.Getpid() || row.pid == cmd.Process.Pid {
+		if strconv.Itoa(row.sid) != ownSID || row.pid == os.Getpid() || row.pid == cmd.Process.Pid || row.pgid <= 1 {
 			continue
 		}
 		cwd, ok := claudeTUIProcessCwd(row.pid)
