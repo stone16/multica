@@ -576,11 +576,14 @@ func claudeTUISignal(cmd *exec.Cmd, sig syscall.Signal) {
 // A local-directory task has no proof that a process in the user's directory
 // belongs to this run, so it receives only the owned process-group signal.
 func claudeTUISignalOwned(cmd *exec.Cmd, opts ExecOptions, sig syscall.Signal) {
-	claudeTUISignal(cmd, sig)
-	if !opts.CwdOwnedByDaemon || opts.Cwd == "" || (runtime.GOOS != "darwin" && runtime.GOOS != "linux") {
-		return
+	var groups []int
+	if opts.CwdOwnedByDaemon && opts.Cwd != "" && (runtime.GOOS == "darwin" || runtime.GOOS == "linux") {
+		// Capture cwd-owned groups before signalling Claude: the leader may exit
+		// immediately, leaving a tool child reparented under PID 1.
+		groups = claudeTUIOwnedCwdProcesses(cmd, opts.Cwd)
 	}
-	for _, p := range claudeTUIOwnedCwdProcesses(cmd, opts.Cwd) {
+	claudeTUISignal(cmd, sig)
+	for _, p := range groups {
 		if p == cmd.Process.Pid {
 			continue
 		}
@@ -600,9 +603,7 @@ func claudeTUIOwnedCwdProcesses(cmd *exec.Cmd, root string) []int {
 	if err != nil {
 		return nil
 	}
-	ownSID := strconv.Itoa(cmd.Process.Pid)
-	type proc struct{ pid, ppid, pgid, sid int }
-	var rows []proc
+	var rows []claudeTUIProc
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) != 4 {
@@ -615,14 +616,26 @@ func claudeTUIOwnedCwdProcesses(cmd *exec.Cmd, root string) []int {
 		if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
 			continue
 		}
-		rows = append(rows, proc{pid: pid, ppid: ppid, pgid: pgid, sid: sid})
+		rows = append(rows, claudeTUIProc{pid: pid, ppid: ppid, pgid: pgid, sid: sid})
 	}
 	var pids []int
+	var cwdByPID map[int]string
+	if runtime.GOOS == "darwin" {
+		cwdByPID = claudeTUIProcessCwds(rows)
+	}
 	for _, row := range rows {
-		if strconv.Itoa(row.sid) != ownSID || row.pid == os.Getpid() || row.pid == cmd.Process.Pid || row.pgid <= 1 {
+		// A daemon-owned task workdir is unique to this run, so cwd is the
+		// ownership proof even after Claude exits and its child is reparented.
+		// Local-directory tasks never call this helper because their cwd is user-owned.
+		if row.pid == os.Getpid() || row.pid == cmd.Process.Pid || row.pgid <= 1 {
 			continue
 		}
-		cwd, ok := claudeTUIProcessCwd(row.pid)
+		cwd, ok := "", false
+		if cwdByPID != nil {
+			cwd, ok = cwdByPID[row.pid]
+		} else {
+			cwd, ok = claudeTUIProcessCwd(row.pid)
+		}
 		if ok && pathWithin(cwd, root) {
 			pids = append(pids, row.pgid)
 		}
@@ -630,12 +643,48 @@ func claudeTUIOwnedCwdProcesses(cmd *exec.Cmd, root string) []int {
 	return pids
 }
 
+type claudeTUIProc struct{ pid, ppid, pgid, sid int }
+
+func claudeTUIProcessCwds(rows []claudeTUIProc) map[int]string {
+	if len(rows) == 0 {
+		return nil
+	}
+	result := make(map[int]string)
+	for start := 0; start < len(rows); start += 128 {
+		end := start + 128
+		if end > len(rows) {
+			end = len(rows)
+		}
+		pids := make([]string, 0, end-start)
+		for _, row := range rows[start:end] {
+			pids = append(pids, strconv.Itoa(row.pid))
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		out, err := exec.CommandContext(ctx, "lsof", "-b", "-a", "-d", "cwd", "-Fn", "-p", strings.Join(pids, ",")).Output()
+		cancel()
+		if err != nil {
+			continue
+		}
+		pid := 0
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.HasPrefix(line, "p") {
+				pid, _ = strconv.Atoi(strings.TrimPrefix(line, "p"))
+			} else if strings.HasPrefix(line, "n") && pid > 0 {
+				result[pid] = strings.TrimPrefix(line, "n")
+			}
+		}
+	}
+	return result
+}
+
 func claudeTUIProcessCwd(pid int) (string, bool) {
 	if runtime.GOOS == "linux" {
 		cwd, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "cwd"))
 		return cwd, err == nil
 	}
-	out, err := exec.Command("lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "lsof", "-b", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn").Output()
 	if err != nil {
 		return "", false
 	}

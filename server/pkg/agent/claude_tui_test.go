@@ -5,6 +5,7 @@ package agent
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -257,6 +258,26 @@ func TestClaudeTUIPathWithin(t *testing.T) {
 	if !pathWithin("/task/work/sub", "/task/work") || pathWithin("/task/worker", "/task/work") || pathWithin("/other", "/task/work") {
 		t.Fatal("pathWithin ownership boundary incorrect")
 	}
+}
+
+func TestClaudeTUIOwnedCwdProcessesFindsChildAfterLeaderExit(t *testing.T) {
+	root := t.TempDir()
+	cmd := exec.Command("/bin/sh", "-c", "sleep 60")
+	cmd.Dir = root
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	claudeTUISignalOwned(cmd, ExecOptions{Cwd: root, CwdOwnedByDaemon: true}, syscall.SIGTERM)
+	_ = cmd.Wait()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(claudeTUIOwnedCwdProcesses(cmd, root)) == 0 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("owned cwd sweep did not terminate the child before the leader exited")
 }
 
 func TestClaudeTUIScreenTextRemovesCursorMoves(t *testing.T) {
