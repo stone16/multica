@@ -4,7 +4,6 @@ package agent
 
 import (
 	"golang.org/x/sys/unix"
-	"os"
 	"strconv"
 )
 
