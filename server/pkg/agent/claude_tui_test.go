@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -184,5 +186,50 @@ func TestClaudeTUIScreenTextRemovesCursorMoves(t *testing.T) {
 	got := tuiScreenText(raw)
 	if !strings.Contains(got, "No, exit") || !strings.Contains(got, "Yes,Itrustthisfolder") {
 		t.Fatalf("screen text = %q", got)
+	}
+}
+
+func TestClaudeTUIUnknownScreenTimesOutAndKillsProcess(t *testing.T) {
+	previousTimeout := claudeTUIStartupTimeout
+	claudeTUIStartupTimeout = time.Second
+	defer func() { claudeTUIStartupTimeout = previousTimeout }()
+
+	tmp := t.TempDir()
+	home := t.TempDir()
+	cwd := t.TempDir()
+	fake := filepath.Join(tmp, "fake-unknown-claude.py")
+	pidFile := filepath.Join(tmp, "pid")
+	script := fmt.Sprintf(`#!/usr/bin/env python3
+import os, time
+with open(%q, "w") as f: f.write(str(os.getpid()))
+os.write(1, b"\x1b[?2004h\x1b[?999zUNKNOWN-MODAL")
+time.sleep(60)
+`, pidFile)
+	if err := os.WriteFile(fake, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	backend := &claudeTUIBackend{cfg: Config{ClaudeMode: "tui", ExecutablePath: fake, Env: map[string]string{"HOME": home}}}
+	session, err := backend.Execute(t.Context(), "hello", ExecOptions{Cwd: cwd, Timeout: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-session.Result:
+		if result.Status != "failed" || result.Error != "claude tui startup timed out" {
+			t.Fatalf("result = %+v, want startup timeout", result)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("unknown screen did not fail within startup timeout")
+	}
+	pidBytes, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pid int
+	if _, err := fmt.Sscanf(string(pidBytes), "%d", &pid); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(pid, 0); err == nil {
+		t.Fatalf("fake Claude pid %d survived startup timeout", pid)
 	}
 }

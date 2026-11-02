@@ -23,7 +23,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const claudeTUIStartupTimeout = 30 * time.Second
+var claudeTUIStartupTimeout = 30 * time.Second
 
 // claudeTUIBackend runs the published interactive Claude binary in a PTY. The
 // transcript, rather than the rendered screen, owns semantic events.
