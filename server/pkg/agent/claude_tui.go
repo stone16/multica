@@ -3,7 +3,6 @@
 package agent
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -315,7 +314,8 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			_ = master.Close()
 			<-readDone
 			_ = b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, usageBaseline, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd)
-			results <- Result{Status: "cancelled", Error: "execution cancelled", SessionID: sessionID, Usage: usage}
+			resultSession, rejected := tuiResultSession(opts, sessionID, false, promptRows, finalErr)
+			results <- Result{Status: "cancelled", Error: "execution cancelled", SessionID: resultSession, ResumeRejected: rejected, Usage: usage}
 			return
 		case chunk, ok := <-ptyBytes:
 			if !ok {
@@ -402,7 +402,8 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			}
 			if pasted && promptRows == 0 && time.Since(pasteAt) > 10*time.Second {
 				claudeTUISignalOwned(cmd, opts, syscall.SIGTERM)
-				results <- Result{Status: "failed", Error: "claude tui produced no transcript receipt within 10s", SessionID: sessionID, Usage: usage}
+				resultSession, rejected := tuiResultSession(opts, sessionID, true, promptRows, "claude tui produced no transcript receipt within 10s")
+				results <- Result{Status: "failed", Error: "claude tui produced no transcript receipt within 10s", SessionID: resultSession, ResumeRejected: rejected, Usage: usage}
 				return
 			}
 			if sawResult && !terminal.Load() {
@@ -430,7 +431,9 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			mu.Lock()
 			tail := tuiScreenTail(screen.String())
 			mu.Unlock()
-			results <- Result{Status: "failed", Error: "claude tui startup timed out: " + tail, SessionID: sessionID, Usage: usage}
+			errText := "claude tui startup timed out: " + tail
+			resultSession, rejected := tuiResultSession(opts, sessionID, true, promptRows, errText)
+			results <- Result{Status: "failed", Error: errText, SessionID: resultSession, ResumeRejected: rejected, Usage: usage}
 			return
 		case <-procDone:
 			_, _ = watchdogW.WriteString("done\n")
@@ -447,10 +450,22 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			if finalErr != "" {
 				status = "failed"
 			}
-			results <- Result{Status: status, Output: finalText, Error: finalErr, SessionID: sessionID, Usage: usage}
+			resultSession, rejected := tuiResultSession(opts, sessionID, status == "failed", promptRows, finalErr)
+			results <- Result{Status: status, Output: finalText, Error: finalErr, SessionID: resultSession, ResumeRejected: rejected, Usage: usage}
 			return
 		}
 	}
+}
+
+// tuiResultSession never returns the requested resume id when the run failed
+// before Claude accepted a new prompt. Keeping that id would make the daemon
+// retry a known stale transcript instead of clearing it.
+func tuiResultSession(opts ExecOptions, emitted string, failed bool, promptRows int, errText string) (string, bool) {
+	rejected := resumeWasRejected(opts.ResumeSessionID, emitted, failed, errText)
+	if rejected || (failed && opts.ResumeSessionID != "" && promptRows == 0) {
+		return "", rejected
+	}
+	return emitted, rejected
 }
 
 // respondTUIQueries answers the device-status queries Claude uses to finish
@@ -649,26 +664,35 @@ func (b *claudeTUIBackend) readTUITranscript(cfgDir, sessionID string, offsets m
 			continue
 		}
 		off := offsets[path]
-		if _, err := f.Seek(off, io.SeekStart); err != nil {
+		st, err := f.Stat()
+		if err != nil || off >= st.Size() {
 			_ = f.Close()
 			continue
 		}
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 64<<10), agentStreamMaxLineBytes)
-		for scanner.Scan() {
-			line := scanner.Bytes()
+		data, err := io.ReadAll(io.NewSectionReader(f, off, st.Size()-off))
+		if err != nil {
+			_ = f.Close()
+			continue
+		}
+		lastNL := bytes.LastIndexByte(data, '\n')
+		if lastNL < 0 {
+			// Keep the offset at the start of a row while Claude is still
+			// writing it; the next poll will see the complete JSON object.
+			_ = f.Close()
+			continue
+		}
+		for _, line := range bytes.Split(data[:lastNL], []byte{'\n'}) {
+			if len(line) > agentStreamMaxLineBytes {
+				_ = f.Close()
+				return fmt.Errorf("claude transcript row exceeds %d bytes", agentStreamMaxLineBytes)
+			}
 			var raw map[string]any
 			if json.Unmarshal(line, &raw) != nil {
 				continue
 			}
 			b.processTUIRow(raw, ch, usage, baseline, seen, finalText, finalErr, sawResult, terminalReason, promptRows, sessionID, expectedCwd)
-			off += int64(len(line) + 1)
 		}
-		offInfo, _ := f.Seek(0, io.SeekCurrent)
-		if offInfo > off {
-			off = offInfo
-		}
-		offsets[path] = off
+		offsets[path] = off + int64(lastNL+1)
 		_ = f.Close()
 	}
 	return nil
@@ -768,13 +792,13 @@ func (b *claudeTUIBackend) processTUIRow(raw map[string]any, ch chan<- Message, 
 			}
 		}
 		if isAPIErrorRow(raw) {
-			*finalErr = fmt.Sprint(raw["error"])
-			if *finalErr == "<nil>" || *finalErr == "" {
-				*finalErr = fmt.Sprint(raw["message"])
-			}
+			*finalErr = tuiProviderErrorText(raw)
 		}
 	case "system":
 		sub, _ := raw["subtype"].(string)
+		if isAPIErrorRow(raw) {
+			*finalErr = tuiProviderErrorText(raw)
+		}
 		if sub == "turn_duration" && *promptRows > 0 {
 			*sawResult = true
 			if r, ok := raw["terminal_reason"].(string); ok {
@@ -798,6 +822,25 @@ func (b *claudeTUIBackend) processTUIRow(raw map[string]any, ch chan<- Message, 
 			usage[model] = current
 		}
 	}
+}
+
+func tuiProviderErrorText(raw map[string]any) string {
+	for _, key := range []string{"error", "errorDetails", "message", "result"} {
+		if value, ok := raw[key]; ok {
+			switch v := value.(type) {
+			case string:
+				if strings.TrimSpace(v) != "" {
+					return v
+				}
+			case map[string]any:
+				if data, err := json.Marshal(v); err == nil {
+					return string(data)
+				}
+			}
+		}
+	}
+	data, _ := json.Marshal(raw)
+	return string(data)
 }
 
 func isAPIErrorRow(raw map[string]any) bool {

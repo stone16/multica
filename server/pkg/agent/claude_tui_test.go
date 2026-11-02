@@ -94,6 +94,82 @@ func TestClaudeTUIResumeRecoveryRowsDoNotSealOrEmit(t *testing.T) {
 	}
 }
 
+func TestClaudeTUIResultSessionClearsRefusedResume(t *testing.T) {
+	opts := ExecOptions{ResumeSessionID: "old-session"}
+	if got, rejected := tuiResultSession(opts, "old-session", true, 0, "claude: no conversation found"); got != "" || !rejected {
+		t.Fatalf("refused resume = (%q, %v), want empty and rejected", got, rejected)
+	}
+	if got, rejected := tuiResultSession(opts, "old-session", true, 0, "claude tui startup timed out"); got != "" || rejected {
+		t.Fatalf("unaccepted resume = (%q, %v), want empty and not rejected", got, rejected)
+	}
+	if got, rejected := tuiResultSession(opts, "old-session", true, 1, "provider rate limit"); got != "old-session" || rejected {
+		t.Fatalf("failed resumed turn = (%q, %v), want retained session", got, rejected)
+	}
+}
+
+func TestClaudeTUITranscriptTailRetainsPartialRow(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, "projects", "p", "session.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	row := `{"type":"user","message":{"content":"hello"}}`
+	if err := os.WriteFile(path, []byte(row), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b := &claudeTUIBackend{}
+	offsets := map[string]int64{}
+	ch := make(chan Message, 4)
+	finalText, finalErr := "", ""
+	sawResult, reason, promptRows := false, "", 0
+	if err := b.readTUITranscript(home, "session", offsets, ch, map[string]TokenUsage{}, map[string]TokenUsage{}, map[string]struct{}{}, &finalText, &finalErr, &sawResult, &reason, &promptRows, ""); err != nil {
+		t.Fatal(err)
+	}
+	if offsets[path] != 0 || promptRows != 0 {
+		t.Fatalf("partial row advanced state: offset=%d rows=%d", offsets[path], promptRows)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if err := b.readTUITranscript(home, "session", offsets, ch, map[string]TokenUsage{}, map[string]TokenUsage{}, map[string]struct{}{}, &finalText, &finalErr, &sawResult, &reason, &promptRows, ""); err != nil {
+		t.Fatal(err)
+	}
+	if promptRows != 1 || offsets[path] != int64(len(row)+1) {
+		t.Fatalf("completed row not consumed: offset=%d rows=%d", offsets[path], promptRows)
+	}
+}
+
+func TestClaudeTUITranscriptTailRejectsOversizedRow(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, "projects", "p", "session.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append([]byte(strings.Repeat("x", agentStreamMaxLineBytes+1)), '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b := &claudeTUIBackend{}
+	ch := make(chan Message, 1)
+	finalText, finalErr := "", ""
+	sawResult, reason, promptRows := false, "", 0
+	err := b.readTUITranscript(home, "session", map[string]int64{}, ch, map[string]TokenUsage{}, map[string]TokenUsage{}, map[string]struct{}{}, &finalText, &finalErr, &sawResult, &reason, &promptRows, "")
+	if err == nil || !strings.Contains(err.Error(), "transcript row exceeds") {
+		t.Fatalf("oversized row error = %v", err)
+	}
+}
+
+func TestClaudeTUIProviderErrorPreservesMessage(t *testing.T) {
+	raw := map[string]any{"type": "assistant", "isApiErrorMessage": true, "error": "rate_limit_error: try again later", "errorDetails": map[string]any{"retry_after": 3}}
+	if got := tuiProviderErrorText(raw); got != "rate_limit_error: try again later" {
+		t.Fatalf("provider error = %q", got)
+	}
+}
+
 func TestClaudeTUIBackendWithFakeClaude(t *testing.T) {
 	if testing.Short() {
 		t.Skip("PTY integration test")
