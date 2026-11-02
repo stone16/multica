@@ -286,6 +286,12 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				clean := tuiPasteText(prompt)
 				_, _ = master.Write([]byte("\x1b[200~" + clean + "\x1b[201~"))
 				pasted = true
+				if !startup.Stop() {
+					select {
+					case <-startup.C:
+					default:
+					}
+				}
 				waitStart = time.Now()
 			}
 			if pasted && !entered && !waitStart.IsZero() && time.Since(waitStart) > 150*time.Millisecond {
