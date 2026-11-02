@@ -84,7 +84,7 @@ func TestClaudeTUIResumeRecoveryRowsDoNotSealOrEmit(t *testing.T) {
 	sawResult := false
 	reason := ""
 	rows := 0
-	backend.processTUIRow(row, ch, map[string]TokenUsage{}, map[string]struct{}{}, &finalText, &finalErr, &sawResult, &reason, &rows, "session-1", "")
+	backend.processTUIRow(row, ch, map[string]TokenUsage{}, map[string]TokenUsage{}, map[string]struct{}{}, &finalText, &finalErr, &sawResult, &reason, &rows, "session-1", "")
 	close(ch)
 	for m := range ch {
 		messages = append(messages, m)

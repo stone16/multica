@@ -105,11 +105,18 @@ func (b *claudeTUIBackend) Execute(ctx context.Context, prompt string, opts Exec
 	args = append(args, filterCustomArgs(opts.ExtraArgs, claudeBlockedArgs, b.cfg.Logger)...)
 	args = append(args, filterCustomArgs(opts.CustomArgs, claudeBlockedArgs, b.cfg.Logger)...)
 
-	cmd := exec.Command(resolved, args...)
+	cmd := b.cfg.commandAt(resolved).exec(runCtx, args...)
+	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(args))
 	cmd.Dir = opts.Cwd
 	cmd.Env = claudeTUIEnv(b.cfg.Env)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true}
+	if err := claudeRootSudoPreflight(args, cmd.Env); err != nil {
+		_ = master.Close()
+		_ = slave.Close()
+		cancel()
+		return nil, err
+	}
 	if err := cmd.Start(); err != nil {
 		_ = master.Close()
 		_ = slave.Close()
@@ -254,12 +261,17 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 	var sawResult bool
 	var terminalReason string
 	usage := map[string]TokenUsage{}
+	usageBaseline := map[string]TokenUsage{}
 	seenMessage := map[string]struct{}{}
 	pathOffsets := map[string]int64{}
 	if opts.ResumeSessionID != "" {
 		if p, err := findClaudeSessionFile(cfgDir, opts.ResumeSessionID); err == nil {
 			if st, statErr := os.Stat(p); statErr == nil {
 				pathOffsets[p] = st.Size()
+				if f, openErr := os.Open(p); openErr == nil {
+					usageBaseline, _, _ = readLastClaudeCostStateUsage(f, 0, st.Size())
+					_ = f.Close()
+				}
 			}
 		}
 	}
@@ -302,7 +314,7 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			}
 			_ = master.Close()
 			<-readDone
-			_ = b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd)
+			_ = b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, usageBaseline, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd)
 			results <- Result{Status: "cancelled", Error: "execution cancelled", SessionID: sessionID, Usage: usage}
 			return
 		case chunk, ok := <-ptyBytes:
@@ -379,7 +391,7 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				enterAt = time.Now()
 			}
 			mu.Unlock()
-			if err := b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd); err != nil && finalErr == "" {
+			if err := b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, usageBaseline, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd); err != nil && finalErr == "" {
 				finalErr = err.Error()
 			}
 			if entered && promptRows == 0 && enterAttempts < 3 && time.Since(enterAt) > 3*time.Second && time.Since(enterAt) < 10*time.Second {
@@ -415,14 +427,17 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			}
 			_ = master.Close()
 			<-readDone
-			results <- Result{Status: "failed", Error: "claude tui startup timed out: " + tuiScreenTail(screen.String()), SessionID: sessionID, Usage: usage}
+			mu.Lock()
+			tail := tuiScreenTail(screen.String())
+			mu.Unlock()
+			results <- Result{Status: "failed", Error: "claude tui startup timed out: " + tail, SessionID: sessionID, Usage: usage}
 			return
 		case <-procDone:
 			_, _ = watchdogW.WriteString("done\n")
 			_ = watchdogW.Close()
 			// The process can exit before the 50ms poll; drain one final tail so
 			// a fast fake (and short real turn) does not lose its terminal row.
-			_ = b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd)
+			_ = b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, usageBaseline, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd)
 			_ = master.Close()
 			<-readDone
 			if !sawResult {
@@ -626,7 +641,7 @@ func claudeTUISamePath(a, b string) bool {
 	return filepath.Clean(a) == filepath.Clean(b)
 }
 
-func (b *claudeTUIBackend) readTUITranscript(cfgDir, sessionID string, offsets map[string]int64, ch chan<- Message, usage map[string]TokenUsage, seen map[string]struct{}, finalText *string, finalErr *string, sawResult *bool, terminalReason *string, promptRows *int, expectedCwd string) error {
+func (b *claudeTUIBackend) readTUITranscript(cfgDir, sessionID string, offsets map[string]int64, ch chan<- Message, usage, baseline map[string]TokenUsage, seen map[string]struct{}, finalText *string, finalErr *string, sawResult *bool, terminalReason *string, promptRows *int, expectedCwd string) error {
 	paths, _ := filepath.Glob(filepath.Join(cfgDir, "projects", "*", sessionID+".jsonl"))
 	for _, path := range paths {
 		f, err := os.Open(path)
@@ -646,7 +661,7 @@ func (b *claudeTUIBackend) readTUITranscript(cfgDir, sessionID string, offsets m
 			if json.Unmarshal(line, &raw) != nil {
 				continue
 			}
-			b.processTUIRow(raw, ch, usage, seen, finalText, finalErr, sawResult, terminalReason, promptRows, sessionID, expectedCwd)
+			b.processTUIRow(raw, ch, usage, baseline, seen, finalText, finalErr, sawResult, terminalReason, promptRows, sessionID, expectedCwd)
 			off += int64(len(line) + 1)
 		}
 		offInfo, _ := f.Seek(0, io.SeekCurrent)
@@ -659,7 +674,7 @@ func (b *claudeTUIBackend) readTUITranscript(cfgDir, sessionID string, offsets m
 	return nil
 }
 
-func (b *claudeTUIBackend) processTUIRow(raw map[string]any, ch chan<- Message, usage map[string]TokenUsage, seen map[string]struct{}, finalText, finalErr *string, sawResult *bool, terminalReason *string, promptRows *int, sessionID, expectedCwd string) {
+func (b *claudeTUIBackend) processTUIRow(raw map[string]any, ch chan<- Message, usage, baseline map[string]TokenUsage, seen map[string]struct{}, finalText, finalErr *string, sawResult *bool, terminalReason *string, promptRows *int, sessionID, expectedCwd string) {
 	typ, _ := raw["type"].(string)
 	switch typ {
 	case "user":
@@ -737,6 +752,9 @@ func (b *claudeTUIBackend) processTUIRow(raw map[string]any, ch chan<- Message, 
 			switch typ {
 			case "text":
 				t, _ := bmap["text"].(string)
+				if *finalText != "" && t != "" {
+					*finalText += "\n"
+				}
 				*finalText += t
 				trySend(ch, Message{Type: MessageText, Content: t})
 			case "thinking":
@@ -770,7 +788,14 @@ func (b *claudeTUIBackend) processTUIRow(raw map[string]any, ch chan<- Message, 
 		models, _ := raw["modelUsage"].(map[string]any)
 		for model, val := range models {
 			m, _ := val.(map[string]any)
-			usage[model] = TokenUsage{InputTokens: int64(number(m["inputTokens"])), OutputTokens: int64(number(m["outputTokens"])), CacheReadTokens: int64(number(m["cacheReadInputTokens"])), CacheWriteTokens: int64(number(m["cacheCreationInputTokens"]))}
+			current := TokenUsage{InputTokens: int64(number(m["inputTokens"])), OutputTokens: int64(number(m["outputTokens"])), CacheReadTokens: int64(number(m["cacheReadInputTokens"])), CacheWriteTokens: int64(number(m["cacheCreationInputTokens"]))}
+			if base, ok := baseline[model]; ok && current.InputTokens >= base.InputTokens && current.OutputTokens >= base.OutputTokens && current.CacheReadTokens >= base.CacheReadTokens && current.CacheWriteTokens >= base.CacheWriteTokens {
+				current.InputTokens -= base.InputTokens
+				current.OutputTokens -= base.OutputTokens
+				current.CacheReadTokens -= base.CacheReadTokens
+				current.CacheWriteTokens -= base.CacheWriteTokens
+			}
+			usage[model] = current
 		}
 	}
 }
