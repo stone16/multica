@@ -440,10 +440,12 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			_ = watchdogW.Close()
 			// The process can exit before the 50ms poll; drain one final tail so
 			// a fast fake (and short real turn) does not lose its terminal row.
-			_ = b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, usageBaseline, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd)
+			if err := b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, usageBaseline, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd); err != nil && finalErr == "" {
+				finalErr = err.Error()
+			}
 			_ = master.Close()
 			<-readDone
-			if !sawResult {
+			if !sawResult && finalErr == "" {
 				finalErr = "claude tui exited without a terminal transcript result"
 			}
 			status := "completed"
