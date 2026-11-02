@@ -3,6 +3,8 @@
 package agent
 
 import (
+	"fmt"
+	"golang.org/x/sys/unix"
 	"os"
 	"syscall"
 )
@@ -26,6 +28,11 @@ func openClaudeTUIpty() (master, slave *os.File, err error) {
 	if err != nil {
 		_ = master.Close()
 		return nil, nil, err
+	}
+	if err := unix.IoctlSetWinsize(int(slave.Fd()), unix.TIOCSWINSZ, &unix.Winsize{Row: 60, Col: 220}); err != nil {
+		_ = master.Close()
+		_ = slave.Close()
+		return nil, nil, fmt.Errorf("set Claude TUI window size: %w", err)
 	}
 	return master, slave, nil
 }

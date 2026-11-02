@@ -18,7 +18,7 @@ func TestClaudeTUIRejectedArg(t *testing.T) {
 			t.Errorf("claudeTUIRejectedArg(%q) = false", arg)
 		}
 	}
-	for _, arg := range []string{"--model=haiku", "--effort", "--no-chrome"} {
+	for _, arg := range []string{"--model=haiku", "--effort"} {
 		if claudeTUIRejectedArg(arg) {
 			t.Errorf("claudeTUIRejectedArg(%q) = true", arg)
 		}
@@ -217,7 +217,7 @@ time.sleep(60)
 	}
 	select {
 	case result := <-session.Result:
-		if result.Status != "failed" || result.Error != "claude tui startup timed out" {
+		if result.Status != "failed" || !strings.HasPrefix(result.Error, "claude tui startup timed out:") {
 			t.Fatalf("result = %+v, want startup timeout", result)
 		}
 	case <-time.After(3 * time.Second):

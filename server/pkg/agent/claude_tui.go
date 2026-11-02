@@ -78,9 +78,19 @@ func (b *claudeTUIBackend) Execute(ctx context.Context, prompt string, opts Exec
 	} else {
 		args = append(args, "--session-id", sessionID)
 	}
-	if opts.ClaudeSettingsPath != "" {
-		args = append(args, "--settings", opts.ClaudeSettingsPath)
+	settingsPath := opts.ClaudeSettingsPath
+	generatedSettings := false
+	if settingsPath == "" {
+		settingsPath, err = writeClaudeTUISettings("")
+		if err != nil {
+			_ = master.Close()
+			_ = slave.Close()
+			cancel()
+			return nil, err
+		}
+		generatedSettings = true
 	}
+	args = append(args, "--settings", settingsPath)
 	var mcpPath string
 	if hasManagedMcpConfig(opts.McpConfig) {
 		mcpPath, err = writeMcpConfigToTemp(opts.McpConfig)
@@ -117,7 +127,7 @@ func (b *claudeTUIBackend) Execute(ctx context.Context, prompt string, opts Exec
 		cancel()
 		return nil, fmt.Errorf("create claude tui watchdog pipe: %w", err)
 	}
-	watchdog := exec.Command("/bin/sh", "-c", "read state || exit 0; [ \"$state\" = abort ] || exit 0; kill -TERM -$1 2>/dev/null || exit 0; i=0; while kill -0 -$1 2>/dev/null; do i=$((i+1)); [ \"$i\" -ge 100 ] && break; sleep 0.1; done; kill -KILL -$1 2>/dev/null || true", "claude-tui-watchdog", strconv.Itoa(cmd.Process.Pid))
+	watchdog := exec.Command("/bin/sh", "-c", "read state || state=abort; [ \"$state\" = abort ] || exit 0; kill -TERM -$1 2>/dev/null || exit 0; i=0; while kill -0 -$1 2>/dev/null; do i=$((i+1)); [ \"$i\" -ge 100 ] && break; sleep 0.1; done; kill -KILL -$1 2>/dev/null || true", "claude-tui-watchdog", strconv.Itoa(cmd.Process.Pid))
 	watchdog.Stdin = watchdogR
 	watchdog.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := watchdog.Start(); err != nil {
@@ -138,7 +148,7 @@ func (b *claudeTUIBackend) Execute(ctx context.Context, prompt string, opts Exec
 		close(procDone)
 	}()
 	var terminal atomic.Bool
-	go b.consumeTUI(runCtx, cancel, cmd, master, procDone, watchdogW, watchdog, prompt, sessionID, opts, messages, results, &terminal, mcpPath)
+	go b.consumeTUI(runCtx, cancel, cmd, master, procDone, watchdogW, watchdog, prompt, sessionID, opts, messages, results, &terminal, mcpPath, generatedSettings, settingsPath)
 
 	return &Session{
 		CleanupRequired:  true,
@@ -149,16 +159,52 @@ func (b *claudeTUIBackend) Execute(ctx context.Context, prompt string, opts Exec
 }
 
 func claudeTUIRejectedArg(raw string) bool {
-	flag := raw
+	flag := unshellQuoteArg(raw)
 	if i := strings.IndexByte(flag, '='); i >= 0 {
 		flag = flag[:i]
 	}
 	switch flag {
-	case "--max-turns", "--max-budget-usd", "--json-schema", "--input-format", "--output-format", "--include-partial-messages", "--include-hook-events", "--replay-user-messages", "--no-session-persistence", "--fork-session", "--worktree", "-w", "--tmux", "--init-only", "--from-pr", "--prefill", "--prefill-b64":
+	case "--max-turns", "--max-budget-usd", "--json-schema", "--input-format", "--output-format", "--include-partial-messages", "--include-hook-events", "--replay-user-messages", "--no-session-persistence", "--fork-session", "--worktree", "-w", "--tmux", "--init-only", "--from-pr", "--prefill", "--prefill-b64", "--settings", "--disallowedTools", "--session-id", "--resume", "--no-chrome", "--chrome":
 		return true
 	default:
 		return false
 	}
+}
+
+func writeClaudeTUISettings(existing string) (string, error) {
+	settings := map[string]any{"skipDangerousModePermissionPrompt": true, "permissions": map[string]any{"deny": []string{"AskUserQuestion", "EnterWorktree", "ExitWorktree"}}}
+	if existing != "" {
+		data, err := os.ReadFile(existing)
+		if err != nil {
+			return "", fmt.Errorf("read Claude TUI settings: %w", err)
+		}
+		if err := json.Unmarshal(data, &settings); err != nil {
+			return "", fmt.Errorf("parse Claude TUI settings: %w", err)
+		}
+	}
+	settings["skipDangerousModePermissionPrompt"] = true
+	settings["permissions"] = map[string]any{"deny": []string{"AskUserQuestion", "EnterWorktree", "ExitWorktree"}}
+	data, err := json.Marshal(settings)
+	if err != nil {
+		return "", fmt.Errorf("marshal Claude TUI settings: %w", err)
+	}
+	f, err := os.CreateTemp("", "multica-claude-tui-settings-*.json")
+	if err != nil {
+		return "", fmt.Errorf("create Claude TUI settings: %w", err)
+	}
+	name := f.Name()
+	if err := f.Chmod(0o600); err == nil {
+		_, err = f.Write(data)
+	}
+	closeErr := f.Close()
+	if err != nil || closeErr != nil {
+		_ = os.Remove(name)
+		if err == nil {
+			err = closeErr
+		}
+		return "", fmt.Errorf("write Claude TUI settings: %w", err)
+	}
+	return name, nil
 }
 
 func claudeTUIEnv(extra map[string]string) []string {
@@ -175,7 +221,7 @@ func claudeTUIEnv(extra map[string]string) []string {
 	return out
 }
 
-func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.CancelFunc, cmd *exec.Cmd, master *os.File, procDone <-chan struct{}, watchdogW *os.File, watchdog *exec.Cmd, prompt, sessionID string, opts ExecOptions, messages chan Message, results chan Result, terminal *atomic.Bool, mcpPath string) {
+func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.CancelFunc, cmd *exec.Cmd, master *os.File, procDone <-chan struct{}, watchdogW *os.File, watchdog *exec.Cmd, prompt, sessionID string, opts ExecOptions, messages chan Message, results chan Result, terminal *atomic.Bool, mcpPath string, generatedSettings bool, settingsPath string) {
 	defer cancel()
 	defer close(messages)
 	defer close(results)
@@ -186,16 +232,22 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 	if mcpPath != "" {
 		defer cleanupMcpConfigTemp(mcpPath)
 	}
+	if generatedSettings {
+		defer os.Remove(settingsPath)
+	}
 
 	cfgDir, _ := claudeConfigDir(cmd.Env, opts.Cwd)
 	var mu sync.Mutex
 	var screen strings.Builder
 	var bracketedPasteSeen bool
 	var pasted, entered bool
-	var trustSent, trustAccepted bool
+	var trustAccepted bool
 	trustMoves := 0
 	var trustSince time.Time
 	var enterAt time.Time
+	var pasteAt time.Time
+	var readySince time.Time
+	enterAttempts := 0
 	var promptRows int
 	var finalText string
 	var finalErr string
@@ -223,8 +275,7 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				chunk := append([]byte(nil), buf[:n]...)
 				select {
 				case ptyBytes <- chunk:
-				case <-ctx.Done():
-					return
+				default:
 				}
 			}
 			if err != nil {
@@ -250,6 +301,8 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				claudeTUISignalOwned(cmd, opts, syscall.SIGKILL)
 			}
 			_ = master.Close()
+			<-readDone
+			_ = b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd)
 			results <- Result{Status: "cancelled", Error: "execution cancelled", SessionID: sessionID, Usage: usage}
 			return
 		case chunk, ok := <-ptyBytes:
@@ -277,29 +330,18 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				return r
 			}, s)
 			trust := !trustAccepted && strings.Contains(compact, "No,exit") && strings.Contains(compact, "Yes,Itrustthisfolder")
-			ready := (!trust || trustAccepted) && !strings.Contains(compact, "No,exit") && !strings.Contains(compact, "Yes,Itrustthisfolder") && strings.Contains(s, "❯") && bracketedPasteSeen
-			if trust && !trustSent {
-				_, _ = master.Write([]byte("\x1b[B"))
-				trustSent = true
-				trustMoves = 1
+			if trust && trustSince.IsZero() {
 				trustSince = time.Now()
 			}
-			if ready && !pasted {
-				clean := tuiPasteText(prompt)
-				_, _ = master.Write([]byte("\x1b[200~" + clean + "\x1b[201~"))
-				pasted = true
-				if !startup.Stop() {
-					select {
-					case <-startup.C:
-					default:
-					}
-				}
-				waitStart = time.Now()
+			if !trust {
+				trustSince = time.Time{}
 			}
-			if pasted && !entered && !waitStart.IsZero() && time.Since(waitStart) > 150*time.Millisecond {
-				_, _ = master.Write([]byte("\r"))
-				entered = true
-				enterAt = time.Now()
+			if tuiComposerReady(s) && bracketedPasteSeen {
+				if readySince.IsZero() {
+					readySince = time.Now()
+				}
+			} else {
+				readySince = time.Time{}
 			}
 			mu.Unlock()
 		case <-ticker.C:
@@ -310,29 +352,46 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				}
 				return r
 			}, tuiScreenText(screen.String()))
-			if trustSent && !trustAccepted && !trustSince.IsZero() && time.Since(trustSince) > 300*time.Millisecond {
-				if trustMoves == 1 {
-					// Claude can repaint the modal after the first Down and restore
-					// the No selection; repeat once before committing the choice.
+			if !trustAccepted && !trustSince.IsZero() && time.Since(trustSince) > 300*time.Millisecond {
+				if strings.Contains(compact, "❯No,exit") && trustMoves == 0 {
 					_, _ = master.Write([]byte("\x1b[B"))
-					trustMoves = 2
+					trustMoves = 1
 					trustSince = time.Now()
-				} else if trustMoves == 2 && strings.Contains(compact, "Yes,Itrustthisfolder") {
+				} else if strings.Contains(compact, "❯Yes,Itrustthisfolder") && trustMoves == 1 {
 					_, _ = master.Write([]byte("\r"))
 					trustAccepted = true
 					trustSince = time.Time{}
+					trustMoves = 0
 					screen.Reset()
 				}
+			}
+			if !pasted && !readySince.IsZero() && time.Since(readySince) > 300*time.Millisecond {
+				clean := tuiPasteText(prompt)
+				_, _ = master.Write([]byte("\x1b[200~" + clean + "\x1b[201~"))
+				pasted = true
+				pasteAt = time.Now()
+				waitStart = pasteAt
+			}
+			if pasted && !entered && time.Since(waitStart) > 150*time.Millisecond {
+				_, _ = master.Write([]byte("\r"))
+				entered = true
+				enterAttempts = 1
+				enterAt = time.Now()
 			}
 			mu.Unlock()
 			if err := b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd); err != nil && finalErr == "" {
 				finalErr = err.Error()
 			}
-			if entered && promptRows == 0 && time.Since(enterAt) > 3*time.Second && time.Since(enterAt) < 10*time.Second {
+			if entered && promptRows == 0 && enterAttempts < 3 && time.Since(enterAt) > 3*time.Second && time.Since(enterAt) < 10*time.Second {
 				mu.Lock()
 				_, _ = master.Write([]byte("\r"))
 				mu.Unlock()
-				enterAt = time.Now()
+				enterAttempts++
+			}
+			if pasted && promptRows == 0 && time.Since(pasteAt) > 10*time.Second {
+				claudeTUISignalOwned(cmd, opts, syscall.SIGTERM)
+				results <- Result{Status: "failed", Error: "claude tui produced no transcript receipt within 10s", SessionID: sessionID, Usage: usage}
+				return
 			}
 			if sawResult && !terminal.Load() {
 				terminal.Store(true)
@@ -348,9 +407,15 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			_, _ = watchdogW.WriteString("abort\n")
 			_ = watchdogW.Close()
 			claudeTUISignalOwned(cmd, opts, syscall.SIGTERM)
-			<-procDone
+			select {
+			case <-procDone:
+			case <-time.After(10 * time.Second):
+				claudeTUISignalOwned(cmd, opts, syscall.SIGKILL)
+				<-procDone
+			}
 			_ = master.Close()
-			results <- Result{Status: "failed", Error: "claude tui startup timed out", SessionID: sessionID, Usage: usage}
+			<-readDone
+			results <- Result{Status: "failed", Error: "claude tui startup timed out: " + tuiScreenTail(screen.String()), SessionID: sessionID, Usage: usage}
 			return
 		case <-procDone:
 			_, _ = watchdogW.WriteString("done\n")
@@ -383,6 +448,32 @@ func respondTUIQueries(master *os.File, chunk []byte) {
 	if bytes.Contains(chunk, []byte("\x1b[6n")) {
 		_, _ = master.Write([]byte("\x1b[1;1R"))
 	}
+}
+
+func tuiComposerReady(screen string) bool {
+	if !strings.Contains(screen, "❯\u00a0") {
+		return false
+	}
+	compact := strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, screen)
+	for _, blocked := range []string{"❯1.", "❯2.", "Entertoconfirm", "Esctocancel", "No,exit", "Yes,Itrustthisfolder"} {
+		if strings.Contains(compact, blocked) {
+			return false
+		}
+	}
+	return true
+}
+
+func tuiScreenTail(raw string) string {
+	clean := tuiScreenText(raw)
+	if len(clean) > 512 {
+		clean = clean[len(clean)-512:]
+	}
+	return strings.TrimSpace(clean)
 }
 
 // tuiScreenText removes cursor movement and OSC/CSI control sequences while
@@ -469,11 +560,15 @@ func claudeTUISignalOwned(cmd *exec.Cmd, opts ExecOptions, sig syscall.Signal) {
 // that remain in Claude's session. A child that creates a new session is
 // intentionally skipped because ownership is no longer provable.
 func claudeTUIOwnedCwdProcesses(cmd *exec.Cmd, root string) []int {
-	out, err := exec.Command("ps", "-axo", "pid=,ppid=,pgid=,sid=").Output()
+	sessionColumn := "sid="
+	if runtime.GOOS == "darwin" {
+		sessionColumn = "sess="
+	}
+	out, err := exec.Command("ps", "-axo", "pid=,ppid=,pgid=,"+sessionColumn).Output()
 	if err != nil {
 		return nil
 	}
-	var ownSID string
+	ownSID := strconv.Itoa(cmd.Process.Pid)
 	type proc struct{ pid, ppid, pgid, sid int }
 	var rows []proc
 	for _, line := range strings.Split(string(out), "\n") {
@@ -489,12 +584,6 @@ func claudeTUIOwnedCwdProcesses(cmd *exec.Cmd, root string) []int {
 			continue
 		}
 		rows = append(rows, proc{pid: pid, ppid: ppid, pgid: pgid, sid: sid})
-		if pid == cmd.Process.Pid {
-			ownSID = fields[3]
-		}
-	}
-	if ownSID == "" {
-		return nil
 	}
 	var pids []int
 	for _, row := range rows {
@@ -630,7 +719,16 @@ func (b *claudeTUIBackend) processTUIRow(raw map[string]any, ch chan<- Message, 
 		}
 		id, _ := msg["id"].(string)
 		if id != "" {
+			if _, duplicate := seen[id]; duplicate {
+				return
+			}
 			seen[id] = struct{}{}
+		}
+		if u, ok := msg["usage"].(map[string]any); ok {
+			model, _ := msg["model"].(string)
+			if model != "" {
+				usage[model] = TokenUsage{InputTokens: int64(number(u["input_tokens"])), OutputTokens: int64(number(u["output_tokens"])), CacheReadTokens: int64(number(u["cache_read_input_tokens"])), CacheWriteTokens: int64(number(u["cache_creation_input_tokens"]))}
+			}
 		}
 		blocks, _ := msg["content"].([]any)
 		for _, x := range blocks {
@@ -659,22 +757,20 @@ func (b *claudeTUIBackend) processTUIRow(raw map[string]any, ch chan<- Message, 
 		}
 	case "system":
 		sub, _ := raw["subtype"].(string)
-		if sub == "turn_duration" {
+		if sub == "turn_duration" && *promptRows > 0 {
 			*sawResult = true
 			if r, ok := raw["terminal_reason"].(string); ok {
 				*terminalReason = r
+				if errText := claudeTerminalReasonFailure(r, ""); errText != "" {
+					*finalErr = errText
+				}
 			}
 		}
 	case "cost-state":
 		models, _ := raw["modelUsage"].(map[string]any)
 		for model, val := range models {
 			m, _ := val.(map[string]any)
-			u := usage[model]
-			u.InputTokens += int64(number(m["inputTokens"]))
-			u.OutputTokens += int64(number(m["outputTokens"]))
-			u.CacheReadTokens += int64(number(m["cacheReadInputTokens"]))
-			u.CacheWriteTokens += int64(number(m["cacheCreationInputTokens"]))
-			usage[model] = u
+			usage[model] = TokenUsage{InputTokens: int64(number(m["inputTokens"])), OutputTokens: int64(number(m["outputTokens"])), CacheReadTokens: int64(number(m["cacheReadInputTokens"])), CacheWriteTokens: int64(number(m["cacheCreationInputTokens"]))}
 		}
 	}
 }
