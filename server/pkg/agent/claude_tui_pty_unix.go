@@ -19,6 +19,10 @@ func openClaudeTUIpty() (master, slave *os.File, err error) {
 		_ = master.Close()
 		return nil, nil, err
 	}
+	if err := unix.SetNonblock(fd, true); err != nil {
+		_ = master.Close()
+		return nil, nil, fmt.Errorf("set Claude TUI PTY nonblocking: %w", err)
+	}
 	name, err := claudeTUIptyName(fd)
 	if err != nil {
 		_ = master.Close()

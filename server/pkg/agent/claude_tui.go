@@ -333,6 +333,10 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				ptyBytes <- chunk
 			}
 			if err != nil {
+				if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+					time.Sleep(10 * time.Millisecond)
+					continue
+				}
 				return
 			}
 		}
