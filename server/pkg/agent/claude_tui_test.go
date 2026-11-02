@@ -119,12 +119,13 @@ rows = [
 with open(path, "a", encoding="utf-8") as f:
     for row in rows:
         f.write(json.dumps(row) + "\n"); f.flush()
-time.sleep(0.2)
+time.sleep(60)
 `
 	if err := os.WriteFile(fake, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	backend := &claudeTUIBackend{cfg: Config{ClaudeMode: "tui", ExecutablePath: fake, Env: map[string]string{"HOME": home}}}
+	started := time.Now()
 	session, err := backend.Execute(t.Context(), "hello", ExecOptions{Cwd: cwd, Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -134,6 +135,9 @@ time.sleep(0.2)
 	case result = <-session.Result:
 	case <-time.After(10 * time.Second):
 		t.Fatal("fake Claude did not finish")
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("result cleanup took %s; expected direct process-group termination", elapsed)
 	}
 	if result.Status != "completed" || result.Output != "fake reply" {
 		entries, _ := filepath.Glob(home + "/.claude/projects/fake/*")

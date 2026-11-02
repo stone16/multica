@@ -337,6 +337,10 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				mu.Lock()
 				_, _ = master.Write([]byte{3})
 				mu.Unlock()
+				// Claude can leave the interactive shell alive after writing its
+				// terminal transcript row. Signal the owned process group directly
+				// so Result also acknowledges bounded cleanup.
+				claudeTUISignalOwned(cmd, opts, syscall.SIGTERM)
 			}
 		case <-startup.C:
 			_, _ = watchdogW.WriteString("abort\n")
