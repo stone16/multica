@@ -3,6 +3,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -171,6 +172,75 @@ func TestClaudeTUIProviderErrorPreservesMessage(t *testing.T) {
 	}
 }
 
+func TestClaudeTUIMessageIDKeepsBlocksAndDeduplicatesUsage(t *testing.T) {
+	backend := &claudeTUIBackend{}
+	ch := make(chan Message, 8)
+	finalText, finalErr, reason := "", "", ""
+	sawResult, rows := false, 1
+	seen := map[string]struct{}{}
+	usage := map[string]TokenUsage{}
+	row := map[string]any{
+		"type": "assistant",
+		"message": map[string]any{
+			"id":    "same",
+			"model": "claude-haiku-5-5",
+			"usage": map[string]any{"input_tokens": 7, "output_tokens": 3},
+			"content": []any{
+				map[string]any{"type": "text", "text": "before"},
+				map[string]any{"type": "tool_use", "id": "tool-1", "name": "Bash", "input": map[string]any{"command": "true"}},
+			},
+		},
+	}
+	backend.processTUIRow(row, ch, usage, map[string]TokenUsage{}, seen, &finalText, &finalErr, &sawResult, &reason, &rows, "session", "")
+	row["message"].(map[string]any)["content"] = []any{map[string]any{"type": "text", "text": "after"}, map[string]any{"type": "tool_use", "id": "tool-2", "name": "Read", "input": map[string]any{}}}
+	backend.processTUIRow(row, ch, usage, map[string]TokenUsage{}, seen, &finalText, &finalErr, &sawResult, &reason, &rows, "session", "")
+	close(ch)
+	var messages []Message
+	for message := range ch {
+		messages = append(messages, message)
+	}
+	if finalText != "before\nafter" {
+		t.Fatalf("final text = %q", finalText)
+	}
+	if usage["claude-haiku-5-5"].InputTokens != 7 || usage["claude-haiku-5-5"].OutputTokens != 3 {
+		t.Fatalf("usage = %+v", usage)
+	}
+	var tools int
+	for _, message := range messages {
+		if message.Type == MessageToolUse {
+			tools++
+		}
+	}
+	if tools != 2 {
+		t.Fatalf("tool messages = %d, messages = %+v", tools, messages)
+	}
+}
+
+func TestClaudeTUISettingsMergePreservesDeny(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(path, []byte(`{"permissions":{"deny":["Skill(secret)"]},"skillOverrides":{"secret":"off"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	merged, err := writeClaudeTUISettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(merged)
+	data, err := os.ReadFile(merged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatal(err)
+	}
+	permissions := settings["permissions"].(map[string]any)
+	deny := permissions["deny"].([]any)
+	if len(deny) != 4 || deny[0] != "Skill(secret)" || !settings["skipDangerousModePermissionPrompt"].(bool) {
+		t.Fatalf("merged settings = %s", data)
+	}
+}
+
 func TestClaudeTUIBackendWithFakeClaude(t *testing.T) {
 	if testing.Short() {
 		t.Skip("PTY integration test")
@@ -275,7 +345,7 @@ func TestClaudeTUIOwnedCwdProcessesFindsChildAfterLeaderExit(t *testing.T) {
 	}
 }
 
-func TestClaudeTUISignalOwnedSkipsUnownedCwd(t *testing.T) {
+func TestClaudeTUISignalOwnedKillsOnlyDescendants(t *testing.T) {
 	root := t.TempDir()
 	childFile := filepath.Join(root, "child.pid")
 	cmd := exec.Command("/bin/sh", "-c", fmt.Sprintf("sleep 60 & echo $! > %q; wait", childFile))
@@ -298,8 +368,9 @@ func TestClaudeTUISignalOwnedSkipsUnownedCwd(t *testing.T) {
 		t.Fatal("child pid was not written")
 	}
 	claudeTUISignalOwned(cmd, ExecOptions{Cwd: root, CwdOwnedByDaemon: false}, syscall.SIGTERM)
-	if err := syscall.Kill(childPID, 0); err != nil {
-		t.Fatalf("unowned cwd child was signaled: %v", err)
+	time.Sleep(50 * time.Millisecond)
+	if err := syscall.Kill(childPID, 0); err == nil {
+		t.Fatalf("descendant process %d survived owned-tree cancellation", childPID)
 	}
 	_ = syscall.Kill(childPID, syscall.SIGKILL)
 	_ = cmd.Wait()
@@ -355,5 +426,27 @@ time.sleep(60)
 	}
 	if err := syscall.Kill(pid, 0); err == nil {
 		t.Fatalf("fake Claude pid %d survived startup timeout", pid)
+	}
+}
+
+func TestClaudeTUITimeoutStatus(t *testing.T) {
+	tmp, home, cwd := t.TempDir(), t.TempDir(), t.TempDir()
+	fake := filepath.Join(tmp, "fake-timeout-claude.py")
+	script := "#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n"
+	if err := os.WriteFile(fake, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	backend := &claudeTUIBackend{cfg: Config{ClaudeMode: "tui", ExecutablePath: fake, Env: map[string]string{"HOME": home}}}
+	session, err := backend.Execute(t.Context(), "hello", ExecOptions{Cwd: cwd, Timeout: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-session.Result:
+		if result.Status != "timeout" {
+			t.Fatalf("result = %+v, want timeout", result)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout result not delivered")
 	}
 }

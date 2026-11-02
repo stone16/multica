@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,23 +76,20 @@ func (b *claudeTUIBackend) Execute(ctx context.Context, prompt string, opts Exec
 	} else {
 		args = append(args, "--session-id", sessionID)
 	}
-	settingsPath := opts.ClaudeSettingsPath
-	generatedSettings := false
-	if settingsPath == "" {
-		settingsPath, err = writeClaudeTUISettings("")
-		if err != nil {
-			_ = master.Close()
-			_ = slave.Close()
-			cancel()
-			return nil, err
-		}
-		generatedSettings = true
+	settingsPath, err := writeClaudeTUISettings(opts.ClaudeSettingsPath)
+	if err != nil {
+		_ = master.Close()
+		_ = slave.Close()
+		cancel()
+		return nil, err
 	}
+	generatedSettings := true
 	args = append(args, "--settings", settingsPath)
 	var mcpPath string
 	if hasManagedMcpConfig(opts.McpConfig) {
 		mcpPath, err = writeMcpConfigToTemp(opts.McpConfig)
 		if err != nil {
+			_ = os.Remove(settingsPath)
 			_ = master.Close()
 			_ = slave.Close()
 			cancel()
@@ -110,7 +106,12 @@ func (b *claudeTUIBackend) Execute(ctx context.Context, prompt string, opts Exec
 	cmd.Env = claudeTUIEnv(b.cfg.Env)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true}
+	// Let the backend perform graceful TERM -> bounded KILL cleanup. The
+	// default CommandContext cancellation kills only the leader and leaks tools.
+	cmd.Cancel = func() error { return nil }
+	cmd.WaitDelay = 10 * time.Second
 	if err := claudeRootSudoPreflight(args, cmd.Env); err != nil {
+		_ = os.Remove(settingsPath)
 		_ = master.Close()
 		_ = slave.Close()
 		cancel()
@@ -123,13 +124,23 @@ func (b *claudeTUIBackend) Execute(ctx context.Context, prompt string, opts Exec
 		if mcpPath != "" {
 			cleanupMcpConfigTemp(mcpPath)
 		}
+		_ = os.Remove(settingsPath)
 		return nil, fmt.Errorf("start claude tui: %w", err)
+	}
+	rootInfo, err := readCursorUnixProcessInfo(cmd.Process.Pid)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_ = master.Close()
+		_ = os.Remove(settingsPath)
+		cancel()
+		return nil, fmt.Errorf("inspect claude tui process: %w", err)
 	}
 	_ = slave.Close()
 	watchdogR, watchdogW, err := os.Pipe()
 	if err != nil {
 		claudeTUISignal(cmd, syscall.SIGKILL)
 		_ = master.Close()
+		_ = os.Remove(settingsPath)
 		cancel()
 		return nil, fmt.Errorf("create claude tui watchdog pipe: %w", err)
 	}
@@ -141,6 +152,7 @@ func (b *claudeTUIBackend) Execute(ctx context.Context, prompt string, opts Exec
 		_ = watchdogW.Close()
 		claudeTUISignal(cmd, syscall.SIGKILL)
 		_ = master.Close()
+		_ = os.Remove(settingsPath)
 		cancel()
 		return nil, fmt.Errorf("start claude tui watchdog: %w", err)
 	}
@@ -154,7 +166,7 @@ func (b *claudeTUIBackend) Execute(ctx context.Context, prompt string, opts Exec
 		close(procDone)
 	}()
 	var terminal atomic.Bool
-	go b.consumeTUI(runCtx, cancel, cmd, master, procDone, watchdogW, watchdog, prompt, sessionID, opts, messages, results, &terminal, mcpPath, generatedSettings, settingsPath)
+	go b.consumeTUI(runCtx, cancel, cmd, master, procDone, watchdogW, watchdog, prompt, sessionID, rootInfo.start, opts, messages, results, &terminal, mcpPath, generatedSettings, settingsPath)
 
 	return &Session{
 		CleanupRequired:  true,
@@ -178,7 +190,7 @@ func claudeTUIRejectedArg(raw string) bool {
 }
 
 func writeClaudeTUISettings(existing string) (string, error) {
-	settings := map[string]any{"skipDangerousModePermissionPrompt": true, "permissions": map[string]any{"deny": []string{"AskUserQuestion", "EnterWorktree", "ExitWorktree"}}}
+	settings := map[string]any{}
 	if existing != "" {
 		data, err := os.ReadFile(existing)
 		if err != nil {
@@ -189,7 +201,35 @@ func writeClaudeTUISettings(existing string) (string, error) {
 		}
 	}
 	settings["skipDangerousModePermissionPrompt"] = true
-	settings["permissions"] = map[string]any{"deny": []string{"AskUserQuestion", "EnterWorktree", "ExitWorktree"}}
+	permissions, _ := settings["permissions"].(map[string]any)
+	if permissions == nil {
+		permissions = map[string]any{}
+	}
+	deny := make([]string, 0, 3)
+	switch values := permissions["deny"].(type) {
+	case []any:
+		for _, value := range values {
+			if item, ok := value.(string); ok {
+				deny = append(deny, item)
+			}
+		}
+	case []string:
+		deny = append(deny, values...)
+	}
+	for _, item := range []string{"AskUserQuestion", "EnterWorktree", "ExitWorktree"} {
+		found := false
+		for _, current := range deny {
+			if current == item {
+				found = true
+				break
+			}
+		}
+		if !found {
+			deny = append(deny, item)
+		}
+	}
+	permissions["deny"] = deny
+	settings["permissions"] = permissions
 	data, err := json.Marshal(settings)
 	if err != nil {
 		return "", fmt.Errorf("marshal Claude TUI settings: %w", err)
@@ -227,7 +267,7 @@ func claudeTUIEnv(extra map[string]string) []string {
 	return out
 }
 
-func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.CancelFunc, cmd *exec.Cmd, master *os.File, procDone <-chan struct{}, watchdogW *os.File, watchdog *exec.Cmd, prompt, sessionID string, opts ExecOptions, messages chan Message, results chan Result, terminal *atomic.Bool, mcpPath string, generatedSettings bool, settingsPath string) {
+func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.CancelFunc, cmd *exec.Cmd, master *os.File, procDone <-chan struct{}, watchdogW *os.File, watchdog *exec.Cmd, prompt, sessionID string, rootStart uint64, opts ExecOptions, messages chan Message, results chan Result, terminal *atomic.Bool, mcpPath string, generatedSettings bool, settingsPath string) {
 	defer cancel()
 	defer close(messages)
 	defer close(results)
@@ -248,6 +288,7 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 	var bracketedPasteSeen bool
 	var pasted, entered bool
 	var trustAccepted bool
+	var trustModalSeen bool
 	trustMoves := 0
 	var trustSince time.Time
 	var enterAt time.Time
@@ -259,6 +300,11 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 	var finalErr string
 	var sawResult bool
 	var terminalReason string
+	var cleanupStarted bool
+	var cleanupKilled bool
+	var cleanupAt time.Time
+	var cleanupGroups []int
+	var cleanupIdentities map[int]map[int]uint64
 	usage := map[string]TokenUsage{}
 	usageBaseline := map[string]TokenUsage{}
 	seenMessage := map[string]struct{}{}
@@ -276,7 +322,7 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 	}
 
 	readDone := make(chan struct{})
-	ptyBytes := make(chan []byte, 32)
+	ptyBytes := make(chan []byte, 256)
 	go func() {
 		defer close(readDone)
 		buf := make([]byte, 8192)
@@ -284,10 +330,7 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			n, err := master.Read(buf)
 			if n > 0 {
 				chunk := append([]byte(nil), buf[:n]...)
-				select {
-				case ptyBytes <- chunk:
-				default:
-				}
+				ptyBytes <- chunk
 			}
 			if err != nil {
 				return
@@ -299,23 +342,27 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 	defer ticker.Stop()
 	startup := time.NewTimer(claudeTUIStartupTimeout)
 	defer startup.Stop()
+	startupWaiting := true
 	var waitStart time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			_, _ = watchdogW.WriteString("abort\n")
 			_ = watchdogW.Close()
-			claudeTUISignalOwned(cmd, opts, syscall.SIGTERM)
-			select {
-			case <-procDone:
-			case <-time.After(10 * time.Second):
-				claudeTUISignalOwned(cmd, opts, syscall.SIGKILL)
-			}
+			claudeTUIStop(cmd, opts, procDone, rootStart)
 			_ = master.Close()
-			<-readDone
+			waitClaudeTUIRead(readDone)
 			_ = b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, usageBaseline, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd)
-			resultSession, rejected := tuiResultSession(opts, sessionID, false, promptRows, finalErr)
-			results <- Result{Status: "cancelled", Error: "execution cancelled", SessionID: resultSession, ResumeRejected: rejected, Usage: usage}
+			emittedSession := ""
+			if promptRows > 0 {
+				emittedSession = sessionID
+			}
+			resultSession, rejected := tuiResultSession(opts, emittedSession, false, promptRows, finalErr)
+			status, errText := "cancelled", "execution cancelled"
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				status, errText = "timeout", fmt.Sprintf("execution timed out after %s", opts.Timeout)
+			}
+			results <- Result{Status: status, Error: errText, SessionID: resultSession, ResumeRejected: rejected, Usage: usage}
 			return
 		case chunk, ok := <-ptyBytes:
 			if !ok {
@@ -344,8 +391,9 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			trust := !trustAccepted && strings.Contains(compact, "No,exit") && strings.Contains(compact, "Yes,Itrustthisfolder")
 			if trust && trustSince.IsZero() {
 				trustSince = time.Now()
+				trustModalSeen = true
 			}
-			if !trust {
+			if !trust && !trustModalSeen {
 				trustSince = time.Time{}
 			}
 			if tuiComposerReady(s) && bracketedPasteSeen {
@@ -364,12 +412,12 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				}
 				return r
 			}, tuiScreenText(screen.String()))
-			if !trustAccepted && !trustSince.IsZero() && time.Since(trustSince) > 300*time.Millisecond {
-				if strings.Contains(compact, "❯No,exit") && trustMoves == 0 {
+			if !trustAccepted && trustModalSeen && !trustSince.IsZero() && time.Since(trustSince) > 300*time.Millisecond {
+				if trustMoves == 0 {
 					_, _ = master.Write([]byte("\x1b[B"))
 					trustMoves = 1
 					trustSince = time.Now()
-				} else if strings.Contains(compact, "❯Yes,Itrustthisfolder") && trustMoves == 1 {
+				} else if trustMoves == 1 {
 					_, _ = master.Write([]byte("\r"))
 					trustAccepted = true
 					trustSince = time.Time{}
@@ -391,19 +439,49 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				enterAt = time.Now()
 			}
 			mu.Unlock()
-			if err := b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, usageBaseline, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd); err != nil && finalErr == "" {
+			if err := b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, usageBaseline, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd); err != nil {
 				finalErr = err.Error()
+				_, _ = watchdogW.WriteString("abort\n")
+				claudeTUIStop(cmd, opts, procDone, rootStart)
+				_ = master.Close()
+				waitClaudeTUIRead(readDone)
+				resultSession, rejected := tuiResultSession(opts, "", true, promptRows, finalErr)
+				results <- Result{Status: "failed", Error: finalErr, SessionID: resultSession, ResumeRejected: rejected, Usage: usage}
+				return
 			}
 			if entered && promptRows == 0 && enterAttempts < 3 && time.Since(enterAt) > 3*time.Second && time.Since(enterAt) < 10*time.Second {
 				mu.Lock()
 				_, _ = master.Write([]byte("\r"))
 				mu.Unlock()
 				enterAttempts++
+				enterAt = time.Now()
 			}
 			if pasted && promptRows == 0 && time.Since(pasteAt) > 10*time.Second {
-				claudeTUISignalOwned(cmd, opts, syscall.SIGTERM)
+				_, _ = watchdogW.WriteString("abort\n")
+				claudeTUIStop(cmd, opts, procDone, rootStart)
+				_ = master.Close()
+				waitClaudeTUIRead(readDone)
 				resultSession, rejected := tuiResultSession(opts, sessionID, true, promptRows, "claude tui produced no transcript receipt within 10s")
 				results <- Result{Status: "failed", Error: "claude tui produced no transcript receipt within 10s", SessionID: resultSession, ResumeRejected: rejected, Usage: usage}
+				return
+			}
+			if startupWaiting && promptRows > 0 {
+				startupWaiting = false
+				if !startup.Stop() {
+					select {
+					case <-startup.C:
+					default:
+					}
+				}
+			}
+			if promptRows > 0 && tuiHumanPrompt(compact) {
+				errText := "claude tui is waiting for interactive confirmation"
+				_, _ = watchdogW.WriteString("abort\n")
+				claudeTUIStop(cmd, opts, procDone, rootStart)
+				_ = master.Close()
+				waitClaudeTUIRead(readDone)
+				resultSession, rejected := tuiResultSession(opts, sessionID, true, promptRows, errText)
+				results <- Result{Status: "failed", Error: errText, SessionID: resultSession, ResumeRejected: rejected, Usage: usage}
 				return
 			}
 			if sawResult && !terminal.Load() {
@@ -414,20 +492,24 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				// Claude can leave the interactive shell alive after writing its
 				// terminal transcript row. Signal the owned process group directly
 				// so Result also acknowledges bounded cleanup.
-				claudeTUISignalOwned(cmd, opts, syscall.SIGTERM)
+				cleanupGroups, cleanupIdentities = claudeTUIOwnedProcessGroups(cmd)
+				claudeTUISignalCaptured(cmd, cleanupGroups, cleanupIdentities, syscall.SIGTERM, rootStart)
+				cleanupStarted = true
+				cleanupAt = time.Now()
+			}
+			if cleanupStarted && !cleanupKilled && time.Since(cleanupAt) >= 10*time.Second {
+				claudeTUISignalCaptured(cmd, cleanupGroups, cleanupIdentities, syscall.SIGKILL, rootStart)
+				cleanupKilled = true
 			}
 		case <-startup.C:
+			if !startupWaiting {
+				continue
+			}
 			_, _ = watchdogW.WriteString("abort\n")
 			_ = watchdogW.Close()
-			claudeTUISignalOwned(cmd, opts, syscall.SIGTERM)
-			select {
-			case <-procDone:
-			case <-time.After(10 * time.Second):
-				claudeTUISignalOwned(cmd, opts, syscall.SIGKILL)
-				<-procDone
-			}
+			claudeTUIStop(cmd, opts, procDone, rootStart)
 			_ = master.Close()
-			<-readDone
+			waitClaudeTUIRead(readDone)
 			mu.Lock()
 			tail := tuiScreenTail(screen.String())
 			mu.Unlock()
@@ -444,9 +526,11 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				finalErr = err.Error()
 			}
 			_ = master.Close()
-			<-readDone
+			waitClaudeTUIRead(readDone)
 			if !sawResult && finalErr == "" {
-				finalErr = "claude tui exited without a terminal transcript result"
+				mu.Lock()
+				finalErr = "claude tui exited without a terminal transcript result: " + tuiScreenTail(screen.String())
+				mu.Unlock()
 			}
 			status := "completed"
 			if finalErr != "" {
@@ -464,7 +548,16 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 // retry a known stale transcript instead of clearing it.
 func tuiResultSession(opts ExecOptions, emitted string, failed bool, promptRows int, errText string) (string, bool) {
 	rejected := resumeWasRejected(opts.ResumeSessionID, emitted, failed, errText)
-	if rejected || (failed && opts.ResumeSessionID != "" && promptRows == 0) {
+	if !rejected && failed && opts.ResumeSessionID != "" {
+		compact := strings.Map(func(r rune) rune {
+			if unicode.IsSpace(r) {
+				return -1
+			}
+			return unicode.ToLower(r)
+		}, errText)
+		rejected = strings.Contains(compact, "noconversationfoundwithsessionid")
+	}
+	if rejected || promptRows == 0 {
 		return "", rejected
 	}
 	return emitted, rejected
@@ -498,6 +591,16 @@ func tuiComposerReady(screen string) bool {
 		}
 	}
 	return true
+}
+
+func tuiHumanPrompt(screen string) bool {
+	compact := strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, screen)
+	return strings.Contains(compact, "Doyouwanttoproceed?") || strings.Contains(compact, "Entertoconfirm") && strings.Contains(compact, "Esc")
 }
 
 func tuiScreenTail(raw string) string {
@@ -572,52 +675,153 @@ func claudeTUISignal(cmd *exec.Cmd, sig syscall.Signal) {
 	}
 }
 
-// claudeTUISignalOwned keeps the cwd census behind an explicit ownership bit.
-// A local-directory task has no proof that a process in the user's directory
-// belongs to this run, so it receives only the owned process-group signal.
 func claudeTUISignalOwned(cmd *exec.Cmd, opts ExecOptions, sig syscall.Signal) {
-	var groups []int
-	if opts.CwdOwnedByDaemon && opts.Cwd != "" && (runtime.GOOS == "darwin" || runtime.GOOS == "linux") {
-		// Capture descendants before signalling Claude; the leader may exit
-		// immediately and lose the parent relationship.
-		groups = claudeTUIOwnedCwdProcesses(cmd, opts.Cwd)
+	claudeTUISignalOwnedIdentity(cmd, opts, sig, 0)
+}
+
+func claudeTUISignalOwnedIdentity(cmd *exec.Cmd, opts ExecOptions, sig syscall.Signal, expectedStart uint64) {
+	if cmd == nil || cmd.Process == nil {
+		return
 	}
-	claudeTUISignal(cmd, sig)
+	if expectedStart != 0 {
+		info, err := readCursorUnixProcessInfo(cmd.Process.Pid)
+		if err != nil || info.start != expectedStart {
+			return
+		}
+	}
+	// Capture descendants before signalling Claude; the leader may exit
+	// immediately and lose the parent relationship. The census follows the
+	// verified parent tree, so it is safe for local-directory tasks too.
+	groups, identities := claudeTUIOwnedProcessGroups(cmd)
+	claudeTUISignalCaptured(cmd, groups, identities, sig, expectedStart)
+}
+
+func claudeTUISignalCaptured(cmd *exec.Cmd, groups []int, identities map[int]map[int]uint64, sig syscall.Signal, expectedStart uint64) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	rootMatches := expectedStart == 0 || claudeTUIRootMatches(cmd, expectedStart)
+	if rootMatches {
+		claudeTUISignal(cmd, sig)
+	}
 	for _, p := range groups {
-		if p == cmd.Process.Pid {
+		if p == cmd.Process.Pid || p <= 1 {
+			continue
+		}
+		if !claudeTUIGroupMatches(p, identities[p]) {
 			continue
 		}
 		_ = syscall.Kill(-p, sig)
 	}
 }
 
+func claudeTUIStop(cmd *exec.Cmd, opts ExecOptions, procDone <-chan struct{}, expectedStart uint64) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	groups, identities := claudeTUIOwnedProcessGroups(cmd)
+	if expectedStart == 0 || claudeTUIRootMatches(cmd, expectedStart) {
+		claudeTUISignal(cmd, syscall.SIGTERM)
+	}
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	for {
+		if claudeTUIProcessGone(cmd, procDone) && !claudeTUIGroupsAlive(groups) {
+			return
+		}
+		select {
+		case <-procDone:
+			if !claudeTUIGroupsAlive(groups) {
+				return
+			}
+			time.Sleep(25 * time.Millisecond)
+		case <-deadline.C:
+			if expectedStart == 0 || claudeTUIRootMatches(cmd, expectedStart) {
+				claudeTUISignal(cmd, syscall.SIGKILL)
+			}
+			for _, pgid := range groups {
+				if pgid > 1 {
+					if claudeTUIGroupMatches(pgid, identities[pgid]) {
+						_ = syscall.Kill(-pgid, syscall.SIGKILL)
+					}
+				}
+			}
+			return
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+func claudeTUIRootMatches(cmd *exec.Cmd, expectedStart uint64) bool {
+	if cmd == nil || cmd.Process == nil || expectedStart == 0 {
+		return false
+	}
+	info, err := readCursorUnixProcessInfo(cmd.Process.Pid)
+	return err == nil && !info.zombie && info.start == expectedStart
+}
+
+func claudeTUIProcessGone(cmd *exec.Cmd, procDone <-chan struct{}) bool {
+	select {
+	case <-procDone:
+		return true
+	default:
+	}
+	if cmd == nil || cmd.Process == nil {
+		return true
+	}
+	return errors.Is(syscall.Kill(cmd.Process.Pid, 0), syscall.ESRCH)
+}
+
+func claudeTUIGroupsAlive(groups []int) bool {
+	for _, pgid := range groups {
+		if pgid > 1 && syscall.Kill(-pgid, 0) == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func claudeTUIGroupMatches(pgid int, members map[int]uint64) bool {
+	if pgid <= 1 || len(members) == 0 {
+		return false
+	}
+	infos, err := listCursorUnixProcessInfos()
+	if err != nil {
+		return false
+	}
+	for _, info := range infos {
+		if info.pgid == pgid {
+			if start, ok := members[info.pid]; ok && start == info.start && !info.zombie {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func waitClaudeTUIRead(done <-chan struct{}) {
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+	}
+}
+
 // claudeTUIOwnedCwdProcesses finds Claude's descendants before the leader is
-// signalled. The explicit daemon-owned bit proves that this process tree is
-// ours; local-directory tasks never call this helper.
+// signalled. It follows the live parent tree and never uses cwd matching.
 func claudeTUIOwnedCwdProcesses(cmd *exec.Cmd, root string) []int {
 	_ = root
-	sessionColumn := "sid="
-	if runtime.GOOS == "darwin" {
-		sessionColumn = "sess="
-	}
-	out, err := exec.Command("ps", "-axo", "pid=,ppid=,pgid=,"+sessionColumn).Output()
-	if err != nil {
-		return nil
+	groups, _ := claudeTUIOwnedProcessGroups(cmd)
+	return groups
+}
+
+func claudeTUIOwnedProcessGroups(cmd *exec.Cmd) ([]int, map[int]map[int]uint64) {
+	infos, err := listCursorUnixProcessInfos()
+	if err != nil || cmd == nil || cmd.Process == nil {
+		return nil, nil
 	}
 	var rows []claudeTUIProc
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 4 {
-			continue
-		}
-		pid, e1 := strconv.Atoi(fields[0])
-		ppid, e2 := strconv.Atoi(fields[1])
-		pgid, e3 := strconv.Atoi(fields[2])
-		sid, e4 := strconv.Atoi(fields[3])
-		if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
-			continue
-		}
-		rows = append(rows, claudeTUIProc{pid: pid, ppid: ppid, pgid: pgid, sid: sid})
+	for _, info := range infos {
+		rows = append(rows, claudeTUIProc{pid: info.pid, ppid: info.ppid, pgid: info.pgid, start: info.start})
 	}
 	owned := map[int]bool{cmd.Process.Pid: true}
 	for changed := true; changed; {
@@ -630,20 +834,28 @@ func claudeTUIOwnedCwdProcesses(cmd *exec.Cmd, root string) []int {
 		}
 	}
 	groups := make(map[int]struct{})
+	identities := make(map[int]map[int]uint64)
 	for _, row := range rows {
 		if !owned[row.pid] || row.pid == os.Getpid() || row.pid == cmd.Process.Pid || row.pgid <= 1 {
 			continue
 		}
 		groups[row.pgid] = struct{}{}
+		if identities[row.pgid] == nil {
+			identities[row.pgid] = make(map[int]uint64)
+		}
+		identities[row.pgid][row.pid] = row.start
 	}
 	pids := make([]int, 0, len(groups))
 	for pgid := range groups {
 		pids = append(pids, pgid)
 	}
-	return pids
+	return pids, identities
 }
 
-type claudeTUIProc struct{ pid, ppid, pgid, sid int }
+type claudeTUIProc struct {
+	pid, ppid, pgid int
+	start           uint64
+}
 
 func pathWithin(path, root string) bool {
 	rel, err := filepath.Rel(root, path)
@@ -748,6 +960,9 @@ func (b *claudeTUIBackend) processTUIRow(raw map[string]any, ch chan<- Message, 
 			}
 		}
 	case "assistant":
+		if sidechain, _ := raw["isSidechain"].(bool); sidechain {
+			return
+		}
 		msg, _ := raw["message"].(map[string]any)
 		if *promptRows == 0 {
 			// Synthetic recovery assistant rows (for example, stop_sequence
@@ -757,18 +972,25 @@ func (b *claudeTUIBackend) processTUIRow(raw map[string]any, ch chan<- Message, 
 			}
 		}
 		id, _ := msg["id"].(string)
+		usageKey := ""
 		if id != "" {
-			if _, duplicate := seen[id]; duplicate {
-				return
-			}
-			seen[id] = struct{}{}
+			usageKey = "usage:" + id
 		}
-		if u, ok := msg["usage"].(map[string]any); ok {
+		usageNew := true
+		if usageKey != "" {
+			_, usageNew = seen[usageKey]
+			usageNew = !usageNew
+		}
+		if u, ok := msg["usage"].(map[string]any); ok && usageNew {
+			if usageKey != "" {
+				seen[usageKey] = struct{}{}
+			}
 			model, _ := msg["model"].(string)
 			if model != "" {
 				usage[model] = TokenUsage{InputTokens: int64(number(u["input_tokens"])), OutputTokens: int64(number(u["output_tokens"])), CacheReadTokens: int64(number(u["cache_read_input_tokens"])), CacheWriteTokens: int64(number(u["cache_creation_input_tokens"]))}
 			}
 		}
+		apiError := isAPIErrorRow(raw)
 		blocks, _ := msg["content"].([]any)
 		for _, x := range blocks {
 			bmap, _ := x.(map[string]any)
@@ -776,11 +998,13 @@ func (b *claudeTUIBackend) processTUIRow(raw map[string]any, ch chan<- Message, 
 			switch typ {
 			case "text":
 				t, _ := bmap["text"].(string)
-				if *finalText != "" && t != "" {
-					*finalText += "\n"
+				if !apiError {
+					if *finalText != "" && t != "" {
+						*finalText += "\n"
+					}
+					*finalText += t
+					trySend(ch, Message{Type: MessageText, Content: t})
 				}
-				*finalText += t
-				trySend(ch, Message{Type: MessageText, Content: t})
 			case "thinking":
 				t, _ := bmap["thinking"].(string)
 				trySend(ch, Message{Type: MessageThinking, Content: t})
@@ -795,6 +1019,9 @@ func (b *claudeTUIBackend) processTUIRow(raw map[string]any, ch chan<- Message, 
 			*finalErr = tuiProviderErrorText(raw)
 		}
 	case "system":
+		if sidechain, _ := raw["isSidechain"].(bool); sidechain {
+			return
+		}
 		sub, _ := raw["subtype"].(string)
 		if isAPIErrorRow(raw) {
 			*finalErr = tuiProviderErrorText(raw)
@@ -825,19 +1052,51 @@ func (b *claudeTUIBackend) processTUIRow(raw map[string]any, ch chan<- Message, 
 }
 
 func tuiProviderErrorText(raw map[string]any) string {
-	for _, key := range []string{"error", "errorDetails", "message", "result"} {
+	var parts []string
+	if message, ok := raw["message"].(map[string]any); ok {
+		if content, ok := message["content"].([]any); ok {
+			for _, item := range content {
+				if block, ok := item.(map[string]any); ok {
+					for _, key := range []string{"text", "thinking"} {
+						if text, ok := block[key].(string); ok && strings.TrimSpace(text) != "" {
+							parts = append(parts, text)
+						}
+					}
+				}
+			}
+		} else if text, ok := message["content"].(string); ok && strings.TrimSpace(text) != "" {
+			parts = append(parts, text)
+		}
+	}
+	for _, key := range []string{"errorDetails", "result", "error", "apiErrorStatus"} {
 		if value, ok := raw[key]; ok {
+			var text string
 			switch v := value.(type) {
 			case string:
-				if strings.TrimSpace(v) != "" {
-					return v
+				text = v
+			default:
+				if key == "result" {
+					if data, err := json.Marshal(v); err == nil {
+						text = string(data)
+					}
 				}
-			case map[string]any:
-				if data, err := json.Marshal(v); err == nil {
-					return string(data)
+			}
+			if strings.TrimSpace(text) != "" {
+				duplicate := false
+				for _, existing := range parts {
+					if existing == text {
+						duplicate = true
+						break
+					}
+				}
+				if !duplicate {
+					parts = append(parts, text)
 				}
 			}
 		}
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, " | ")
 	}
 	data, _ := json.Marshal(raw)
 	return string(data)
