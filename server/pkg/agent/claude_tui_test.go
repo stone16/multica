@@ -272,6 +272,62 @@ func TestClaudeTUIProcessRowsTrackPendingTools(t *testing.T) {
 	close(ch)
 }
 
+func TestClaudeTUIQuotedScreenAndBlockingModal(t *testing.T) {
+	for _, scenario := range []string{"quote", "tool-quote", "modal"} {
+		t.Run(scenario, func(t *testing.T) {
+			home, cwd := t.TempDir(), t.TempDir()
+			fake := filepath.Join(t.TempDir(), "claude.py")
+			script := `#!/usr/bin/env python3
+import json, os, sys, time, tty
+sid = sys.argv[sys.argv.index("--session-id") + 1]
+path = os.path.join(os.environ["HOME"], ".claude", "projects", "fake", sid + ".jsonl")
+os.makedirs(os.path.dirname(path), exist_ok=True)
+footer = "Do you want to proceed? ❯1. Yes 2. No Enter to confirm · Esc to cancel"
+# Replayed history must not block the current composer.
+os.write(1, (footer + "\n\x1b[?2004h❯\u00a0").encode())
+tty.setraw(0)
+buf = b""
+while not buf.endswith(b"\x1b[201~"):
+    buf += os.read(0, 1)
+with open(path, "a", encoding="utf-8") as f:
+    def row(value):
+        f.write(json.dumps(value) + "\n"); f.flush()
+    row({"type":"user", "message":{"content":buf.decode()}, "sessionId":sid, "cwd":os.getcwd(), "entrypoint":"cli"})
+    scenario = os.environ["TUI_SCENARIO"]
+    if scenario != "quote":
+        row({"type":"assistant", "message":{"id":"tool", "content":[{"type":"tool_use", "id":"call", "name":"Bash", "input":{"command":"echo Do you want to proceed?"}}]}})
+    os.write(1, (footer if scenario != "tool-quote" else "echo Do you want to proceed?").encode())
+    time.sleep(0.3)
+    if scenario != "modal":
+        row({"type":"user", "message":{"content":[{"type":"tool_result", "tool_use_id":"call", "content":"Do you want to proceed?"}]}})
+        row({"type":"assistant", "message":{"id":"answer", "content":[{"type":"text", "text":footer}], "stop_reason":"end_turn"}})
+        row({"type":"system", "subtype":"turn_duration", "terminal_reason":"end_turn"})
+time.sleep(60)
+`
+			if err := os.WriteFile(fake, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			backend := &claudeTUIBackend{cfg: Config{ClaudeMode: "tui", ExecutablePath: fake, Env: map[string]string{"HOME": home, "TUI_SCENARIO": scenario}}}
+			session, err := backend.Execute(t.Context(), "Do you want to proceed?", ExecOptions{Cwd: cwd, Timeout: 5 * time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case result := <-session.Result:
+				if scenario == "modal" {
+					if result.Status != "failed" || !strings.Contains(result.Error, "interactive confirmation") {
+						t.Fatalf("blocking modal result = %+v", result)
+					}
+				} else if result.Status != "completed" || !strings.Contains(result.Output, "Do you want to proceed?") {
+					t.Fatalf("healthy quotation result = %+v", result)
+				}
+			case <-time.After(8 * time.Second):
+				t.Fatal("fake screen scenario did not finish")
+			}
+		})
+	}
+}
+
 func TestClaudeTUISettingsMergePreservesDeny(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "settings.json")
 	if err := os.WriteFile(path, []byte(`{"permissions":{"deny":["Skill(secret)"]},"skillOverrides":{"secret":"off"}}`), 0o600); err != nil {

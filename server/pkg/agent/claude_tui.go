@@ -352,7 +352,7 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 		select {
 		case <-ctx.Done():
 			claudeTUIStop(cmd, opts, procDone, rootStart)
-			_, _ = watchdogW.WriteString("abort\n")
+			_, _ = watchdogW.WriteString("done\n")
 			_ = watchdogW.Close()
 			_ = master.Close()
 			waitClaudeTUIRead(readDone)
@@ -441,6 +441,8 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			if !pasted && !readySince.IsZero() && time.Since(readySince) > 300*time.Millisecond {
 				clean := tuiPasteText(prompt)
 				_, _ = master.Write([]byte("\x1b[200~" + clean + "\x1b[201~"))
+				// Replayed history cannot identify a modal in the new turn.
+				screen.Reset()
 				pasted = true
 				pasteAt = time.Now()
 				waitStart = pasteAt
@@ -455,7 +457,7 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			if err := b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, usageBaseline, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd); err != nil {
 				finalErr = err.Error()
 				claudeTUIStop(cmd, opts, procDone, rootStart)
-				_, _ = watchdogW.WriteString("abort\n")
+				_, _ = watchdogW.WriteString("done\n")
 				_ = master.Close()
 				waitClaudeTUIRead(readDone)
 				resultSession, rejected := tuiResultSession(opts, "", true, promptRows, finalErr)
@@ -471,7 +473,7 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			}
 			if pasted && promptRows == 0 && time.Since(pasteAt) > 10*time.Second {
 				claudeTUIStop(cmd, opts, procDone, rootStart)
-				_, _ = watchdogW.WriteString("abort\n")
+				_, _ = watchdogW.WriteString("done\n")
 				_ = master.Close()
 				waitClaudeTUIRead(readDone)
 				resultSession, rejected := tuiResultSession(opts, sessionID, true, promptRows, "claude tui produced no transcript receipt within 10s")
@@ -490,7 +492,7 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			if promptRows > 0 && !sawResult && hasPendingTUITool(seenMessage) && tuiHumanPrompt(compact) {
 				errText := "claude tui is waiting for interactive confirmation"
 				claudeTUIStop(cmd, opts, procDone, rootStart)
-				_, _ = watchdogW.WriteString("abort\n")
+				_, _ = watchdogW.WriteString("done\n")
 				_ = master.Close()
 				waitClaudeTUIRead(readDone)
 				resultSession, rejected := tuiResultSession(opts, sessionID, true, promptRows, errText)
@@ -521,7 +523,7 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				continue
 			}
 			claudeTUIStop(cmd, opts, procDone, rootStart)
-			_, _ = watchdogW.WriteString("abort\n")
+			_, _ = watchdogW.WriteString("done\n")
 			_ = watchdogW.Close()
 			_ = master.Close()
 			waitClaudeTUIRead(readDone)
@@ -534,7 +536,7 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			return
 		case <-procDone:
 			if cleanupStarted {
-				claudeTUIWaitCapturedGroups(cmd, procDone, cleanupGroups, cleanupIdentities, rootStart)
+				claudeTUIWaitCapturedGroups(cmd, cleanupGroups, cleanupIdentities, rootStart)
 			}
 			_, _ = watchdogW.WriteString("done\n")
 			_ = watchdogW.Close()
@@ -782,7 +784,7 @@ func claudeTUIStop(cmd *exec.Cmd, opts ExecOptions, procDone <-chan struct{}, ex
 	}
 }
 
-func claudeTUIWaitCapturedGroups(cmd *exec.Cmd, procDone <-chan struct{}, groups []int, identities map[int]map[int]uint64, expectedStart uint64) {
+func claudeTUIWaitCapturedGroups(cmd *exec.Cmd, groups []int, identities map[int]map[int]uint64, expectedStart uint64) {
 	deadline := time.NewTimer(10 * time.Second)
 	defer deadline.Stop()
 	for claudeTUIGroupsAlive(groups) {
