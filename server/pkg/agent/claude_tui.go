@@ -351,9 +351,9 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 	for {
 		select {
 		case <-ctx.Done():
+			claudeTUIStop(cmd, opts, procDone, rootStart)
 			_, _ = watchdogW.WriteString("abort\n")
 			_ = watchdogW.Close()
-			claudeTUIStop(cmd, opts, procDone, rootStart)
 			_ = master.Close()
 			waitClaudeTUIRead(readDone)
 			_ = b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, usageBaseline, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd)
@@ -454,8 +454,8 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			mu.Unlock()
 			if err := b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, usageBaseline, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd); err != nil {
 				finalErr = err.Error()
-				_, _ = watchdogW.WriteString("abort\n")
 				claudeTUIStop(cmd, opts, procDone, rootStart)
+				_, _ = watchdogW.WriteString("abort\n")
 				_ = master.Close()
 				waitClaudeTUIRead(readDone)
 				resultSession, rejected := tuiResultSession(opts, "", true, promptRows, finalErr)
@@ -470,8 +470,8 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				enterAt = time.Now()
 			}
 			if pasted && promptRows == 0 && time.Since(pasteAt) > 10*time.Second {
-				_, _ = watchdogW.WriteString("abort\n")
 				claudeTUIStop(cmd, opts, procDone, rootStart)
+				_, _ = watchdogW.WriteString("abort\n")
 				_ = master.Close()
 				waitClaudeTUIRead(readDone)
 				resultSession, rejected := tuiResultSession(opts, sessionID, true, promptRows, "claude tui produced no transcript receipt within 10s")
@@ -487,10 +487,10 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 					}
 				}
 			}
-			if promptRows > 0 && tuiHumanPrompt(compact) {
+			if promptRows > 0 && !sawResult && hasPendingTUITool(seenMessage) && tuiHumanPrompt(compact) {
 				errText := "claude tui is waiting for interactive confirmation"
-				_, _ = watchdogW.WriteString("abort\n")
 				claudeTUIStop(cmd, opts, procDone, rootStart)
+				_, _ = watchdogW.WriteString("abort\n")
 				_ = master.Close()
 				waitClaudeTUIRead(readDone)
 				resultSession, rejected := tuiResultSession(opts, sessionID, true, promptRows, errText)
@@ -520,9 +520,9 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			if !startupWaiting {
 				continue
 			}
+			claudeTUIStop(cmd, opts, procDone, rootStart)
 			_, _ = watchdogW.WriteString("abort\n")
 			_ = watchdogW.Close()
-			claudeTUIStop(cmd, opts, procDone, rootStart)
 			_ = master.Close()
 			waitClaudeTUIRead(readDone)
 			mu.Lock()
@@ -533,6 +533,9 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			results <- Result{Status: "failed", Error: errText, SessionID: resultSession, ResumeRejected: rejected, Usage: usage}
 			return
 		case <-procDone:
+			if cleanupStarted {
+				claudeTUIWaitCapturedGroups(cmd, procDone, cleanupGroups, cleanupIdentities, rootStart)
+			}
 			_, _ = watchdogW.WriteString("done\n")
 			_ = watchdogW.Close()
 			// The process can exit before the 50ms poll; drain one final tail so
@@ -591,7 +594,9 @@ func respondTUIQueries(master *os.File, chunk []byte) {
 }
 
 func tuiComposerReady(screen string) bool {
-	if !strings.Contains(screen, "❯\u00a0") {
+	if marker := strings.LastIndex(screen, "❯\u00a0"); marker >= 0 {
+		screen = screen[marker:]
+	} else {
 		return false
 	}
 	compact := strings.Map(func(r rune) rune {
@@ -615,7 +620,16 @@ func tuiHumanPrompt(screen string) bool {
 		}
 		return r
 	}, screen)
-	return strings.Contains(compact, "Doyouwanttoproceed?") || strings.Contains(compact, "Entertoconfirm") && strings.Contains(compact, "Esc")
+	return (strings.Contains(compact, "Doyouwanttoproceed?") || strings.Contains(compact, "Entertoconfirm")) && strings.Contains(compact, "❯1.") && strings.Contains(compact, "Esc")
+}
+
+func hasPendingTUITool(seen map[string]struct{}) bool {
+	for key := range seen {
+		if strings.HasPrefix(key, "pending:") {
+			return true
+		}
+	}
+	return false
 }
 
 func tuiScreenTail(raw string) string {
@@ -738,9 +752,7 @@ func claudeTUIStop(cmd *exec.Cmd, opts ExecOptions, procDone <-chan struct{}, ex
 		return
 	}
 	groups, identities := claudeTUIOwnedProcessGroups(cmd)
-	if expectedStart == 0 || claudeTUIRootMatches(cmd, expectedStart) {
-		claudeTUISignal(cmd, syscall.SIGTERM)
-	}
+	claudeTUISignalCaptured(cmd, groups, identities, syscall.SIGTERM, expectedStart)
 	deadline := time.NewTimer(10 * time.Second)
 	defer deadline.Stop()
 	for {
@@ -764,6 +776,19 @@ func claudeTUIStop(cmd *exec.Cmd, opts ExecOptions, procDone <-chan struct{}, ex
 					}
 				}
 			}
+			return
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+func claudeTUIWaitCapturedGroups(cmd *exec.Cmd, procDone <-chan struct{}, groups []int, identities map[int]map[int]uint64, expectedStart uint64) {
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	for claudeTUIGroupsAlive(groups) {
+		select {
+		case <-deadline.C:
+			claudeTUISignalCaptured(cmd, groups, identities, syscall.SIGKILL, expectedStart)
 			return
 		case <-time.After(25 * time.Millisecond):
 		}
@@ -949,6 +974,7 @@ func (b *claudeTUIBackend) processTUIRow(raw map[string]any, ch chan<- Message, 
 				// intentionally ignored; normal tool results remain observable.
 				if *promptRows > 0 {
 					id, _ := bmap["tool_use_id"].(string)
+					delete(seen, "pending:"+id)
 					trySend(ch, Message{Type: MessageToolResult, CallID: id, Output: fmt.Sprint(bmap["content"])})
 				}
 				continue
@@ -1040,6 +1066,9 @@ func (b *claudeTUIBackend) processTUIRow(raw map[string]any, ch chan<- Message, 
 				trySend(ch, Message{Type: MessageThinking, Content: t})
 			case "tool_use":
 				call, _ := bmap["id"].(string)
+				if call != "" {
+					seen["pending:"+call] = struct{}{}
+				}
 				name, _ := bmap["name"].(string)
 				in, _ := bmap["input"].(map[string]any)
 				trySend(ch, Message{Type: MessageToolUse, CallID: call, Tool: name, Input: in})

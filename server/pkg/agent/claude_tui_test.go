@@ -234,6 +234,44 @@ func TestClaudeTUIOutputUsesLatestAssistantMessage(t *testing.T) {
 	}
 }
 
+func TestClaudeTUIHumanPromptRequiresPendingToolFooter(t *testing.T) {
+	for _, screen := range []string{
+		"The model said: Do you want to proceed?",
+		"Do you want to proceed? ❯1. Yes 2. No",
+		"Enter to confirm · Esc to cancel",
+	} {
+		if tuiHumanPrompt(screen) {
+			t.Fatalf("healthy screen text matched interactive prompt: %q", screen)
+		}
+	}
+	if !tuiHumanPrompt("Do you want to proceed? ❯1. Yes 2. No Enter to confirm · Esc to cancel") {
+		t.Fatal("full interactive footer did not match")
+	}
+	if !tuiComposerReady("old answer: Enter to confirm · Esc to cancel\n❯\u00a0") {
+		t.Fatal("replayed history blocked the current composer")
+	}
+}
+
+func TestClaudeTUIProcessRowsTrackPendingTools(t *testing.T) {
+	backend := &claudeTUIBackend{}
+	seen := map[string]struct{}{}
+	ch := make(chan Message, 4)
+	finalText, finalErr, reason := "", "", ""
+	sawResult, rows := false, 1
+	usage := map[string]TokenUsage{}
+	row := map[string]any{"type": "assistant", "message": map[string]any{"id": "a", "content": []any{map[string]any{"type": "tool_use", "id": "tool-1", "name": "Bash", "input": map[string]any{}}}}}
+	backend.processTUIRow(row, ch, usage, nil, seen, &finalText, &finalErr, &sawResult, &reason, &rows, "session", "")
+	if !hasPendingTUITool(seen) {
+		t.Fatal("tool_use did not become pending")
+	}
+	result := map[string]any{"type": "user", "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "tool-1", "content": "ok"}}}}
+	backend.processTUIRow(result, ch, usage, nil, seen, &finalText, &finalErr, &sawResult, &reason, &rows, "session", "")
+	if hasPendingTUITool(seen) {
+		t.Fatal("tool_result did not clear pending tool")
+	}
+	close(ch)
+}
+
 func TestClaudeTUISettingsMergePreservesDeny(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "settings.json")
 	if err := os.WriteFile(path, []byte(`{"permissions":{"deny":["Skill(secret)"]},"skillOverrides":{"secret":"off"}}`), 0o600); err != nil {
