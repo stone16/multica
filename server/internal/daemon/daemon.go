@@ -8598,7 +8598,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		taskCapabilities = append(taskCapabilities, protocol.DaemonCapabilityPiProcessCleanupV1)
 	}
 	var cursorHookCommand []string
-	supplementSupported := agent.SupportsTaskSupplement(provider, resolvedVersion) && task.IssueID != ""
+	supplementSupported := taskSupplementSupported(provider, resolvedVersion, task.IssueID != "", d.cfg.ClaudeMode)
 	if supplementSupported && provider == "cursor" {
 		cursorHookCommand, supplementSupported = cursorSupplementHookCommand(env)
 	}
@@ -8811,6 +8811,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// daemon never calls agent.New or agent.NewRuntime directly, so the two
 	// factories stay meaning exactly one thing each.
 	backendConfig := agent.Config{
+		ClaudeMode:     d.cfg.ClaudeMode,
 		ExecutablePath: entry.Path,
 		LaunchPrefix:   profileFixedArgs,
 		CLIVersion:     resolvedVersion,
@@ -8927,6 +8928,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		EnableTaskSupplement:       taskSupplementNegotiated,
 		CursorHookCommand:          cursorHookCommand,
 		Cwd:                        env.WorkDir,
+		CwdOwnedByDaemon:           env.CwdOwnedByDaemon,
 		PiSkillPaths:               env.PiSkillPaths,
 		Model:                      model,
 		ThreadName:                 deriveTaskThreadName(task),
@@ -9384,6 +9386,16 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			FailureReason: failureReason,
 		}, nil
 	}
+}
+
+// taskSupplementSupported reports whether this daemon can safely negotiate
+// in-turn comments for the selected transport. Claude's PTY transport has no
+// provider-side supplement channel, even though the CLI version itself does.
+func taskSupplementSupported(provider, version string, hasIssue bool, claudeMode string) bool {
+	if !hasIssue || (provider == "claude" && claudeMode == "tui") {
+		return false
+	}
+	return agent.SupportsTaskSupplement(provider, version)
 }
 
 // shouldRetryWithFreshSession reports whether a failed run that requested

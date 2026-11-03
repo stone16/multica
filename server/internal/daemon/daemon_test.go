@@ -59,6 +59,19 @@ func TestNormalizeServerBaseURL(t *testing.T) {
 	}
 }
 
+func TestTaskSupplementSupportedDisablesClaudeTUI(t *testing.T) {
+	t.Parallel()
+	if taskSupplementSupported("claude", "2.1.316 (Claude Code)", true, "tui") {
+		t.Fatal("Claude TUI must not negotiate task supplements")
+	}
+	if !taskSupplementSupported("claude", "2.1.316 (Claude Code)", true, "stream-json") {
+		t.Fatal("Claude stream-json should negotiate task supplements")
+	}
+	if taskSupplementSupported("claude", "2.1.316 (Claude Code)", false, "stream-json") {
+		t.Fatal("runs without an issue must not negotiate task supplements")
+	}
+}
+
 func TestTriggerRestart_BrewLinuxCellarDeleted(t *testing.T) {
 	originalIsBrewInstall := isBrewInstall
 	originalGetBrewPrefix := getBrewPrefix

@@ -152,6 +152,7 @@ type Config struct {
 	OpenCodeIdleWatchdog        time.Duration // OpenCode-specific no-message window; 0 falls back to AgentIdleWatchdog and values above it cannot extend the global bound
 	AgentIdleWatchdog           time.Duration // force-stop a run when the backend goes silent this long with an empty queue (0 = disabled)
 	AgentToolWatchdog           time.Duration // force-stop a run when a single tool call stays in flight (silent) this long (0 = never force-stop during a tool call, which now also covers a live Cursor background shell); defaults to AgentIdleWatchdog, so operators tune one number unless they deliberately want a wider tool budget
+	ClaudeMode                  string        // stream-json (default) or opt-in tui
 	ClaudeArgs                  []string
 	CodexArgs                   []string
 	CodebuddyArgs               []string
@@ -268,6 +269,13 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		return Config{}, fmt.Errorf("no agent CLI found: install claude, codebuddy, codearts, codex, copilot, opencode, deveco, openclaw, hermes, pi, omp, cursor-agent, kimi, reasonix, dsh, kiro-cli, agy, qodercli, qoderclicn, traecli, grok, qwen, qwenpaw, mcode, muse, devin, dim, or zeroclaw and ensure it is on PATH")
 	}
 
+	claudeMode := strings.TrimSpace(os.Getenv("MULTICA_CLAUDE_MODE"))
+	if claudeMode == "" {
+		claudeMode = "stream-json"
+	}
+	if claudeMode != "stream-json" && claudeMode != "tui" {
+		return Config{}, fmt.Errorf("MULTICA_CLAUDE_MODE must be stream-json or tui")
+	}
 	claudeArgs, err := shellArgsFromEnv("MULTICA_CLAUDE_ARGS")
 	if err != nil {
 		return Config{}, err
@@ -658,6 +666,7 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		OpenCodeIdleWatchdog:            openCodeIdleWatchdog,
 		AgentIdleWatchdog:               agentIdleWatchdog,
 		AgentToolWatchdog:               agentToolWatchdog,
+		ClaudeMode:                      claudeMode,
 		ClaudeArgs:                      claudeArgs,
 		CodexArgs:                       codexArgs,
 		CodebuddyArgs:                   codebuddyArgs,
