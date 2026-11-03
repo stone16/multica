@@ -6,11 +6,11 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -68,41 +68,71 @@ func TestClaudeTUIRealAcceptance(t *testing.T) {
 		}
 	})
 
+	t.Run("screen-phrase-in-healthy-output", func(t *testing.T) {
+		result, _ := runRealClaudeTUI(t, backend, "Use Bash to run `printf 'Do you want to proceed?'`, then answer exactly Do you want to proceed?", ExecOptions{Model: "claude-haiku-5-5", Timeout: 90 * time.Second})
+		if result.Status != "completed" || !strings.Contains(result.Output, "Do you want to proceed?") {
+			t.Fatalf("healthy phrase result = %+v", result)
+		}
+	})
+
 	t.Run("resume-delta", func(t *testing.T) {
 		first, _ := runRealClaudeTUI(t, backend, "Answer exactly FIRST_OK.", ExecOptions{Model: "claude-haiku-5-5", Timeout: 60 * time.Second})
 		if first.Status != "completed" || first.SessionID == "" {
 			t.Fatalf("first result = %+v", first)
 		}
+		_, firstUsage := transcriptForResult(t, backend.cfg.Env["HOME"], first.SessionID)
 		second, _ := runRealClaudeTUI(t, backend, "Answer exactly SECOND_OK.", ExecOptions{Model: "claude-haiku-5-5", ResumeSessionID: first.SessionID, Timeout: 60 * time.Second})
 		if second.Status != "completed" || !strings.Contains(second.Output, "SECOND_OK") {
 			t.Fatalf("resume result = %+v", second)
+		}
+		if second.SessionID != first.SessionID {
+			t.Fatalf("resume session = %q, want %q", second.SessionID, first.SessionID)
+		}
+		_, cumulative := transcriptForResult(t, backend.cfg.Env["HOME"], second.SessionID)
+		want := subtractTokenUsage(cumulative.usage, firstUsage.usage)
+		if second.Usage[cumulative.model] != want {
+			t.Fatalf("resume usage = %+v, want delta %+v", second.Usage[cumulative.model], want)
 		}
 	})
 
 	t.Run("cancel-and-decoy", func(t *testing.T) {
 		cwd := t.TempDir()
-		decoy := exec.Command("/bin/sleep", "120")
+		decoy := exec.Command("/bin/sleep", "123")
 		decoy.Dir = cwd
 		if err := decoy.Start(); err != nil {
 			t.Fatal(err)
 		}
 		defer func() { _ = decoy.Process.Kill(); _ = decoy.Wait() }()
-		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-		defer cancel()
-		result, _ := runRealClaudeTUIContext(t, backend, ctx, "Use Bash to run `sleep 120 & wait`, then answer CANCEL_OK.", ExecOptions{Model: "claude-haiku-5-5", Cwd: cwd, CwdOwnedByDaemon: false, Timeout: 5 * time.Minute})
-		if result.Status != "cancelled" && result.Status != "timeout" {
-			t.Fatalf("cancel result = %+v", result)
+		result, messages := runRealClaudeCancel(t, backend, "Use Bash to run `sleep 127 & wait`, then answer CANCEL_OK.", ExecOptions{Model: "claude-haiku-5-5", Cwd: cwd, CwdOwnedByDaemon: false, Timeout: 5 * time.Minute})
+		if result.Status != "cancelled" || !hasToolUse(messages) {
+			t.Fatalf("local cancel result = %+v messages=%+v", result, messages)
 		}
-		if err := decoy.Process.Signal(syscall.Signal(0)); err != nil {
-			t.Fatalf("decoy process was harmed: %v", err)
+		if state := processState(decoy.Process.Pid); state == "Z" || state == "" {
+			t.Fatalf("decoy state after cancellation = %q", state)
 		}
+		if leftover := processContains("sleep 127"); leftover {
+			t.Fatal("local-directory tool process survived cancellation")
+		}
+		_ = decoy.Process.Kill()
+		_ = decoy.Wait()
 		owned := t.TempDir()
-		ownedCtx, ownedCancel := context.WithTimeout(context.Background(), 4*time.Second)
-		defer ownedCancel()
-		ownedResult, _ := runRealClaudeTUIContext(t, backend, ownedCtx, "Use Bash to run `sleep 120 & wait`, then answer OWNED_CANCEL_OK.", ExecOptions{Model: "claude-haiku-5-5", Cwd: owned, CwdOwnedByDaemon: true, Timeout: 5 * time.Minute})
-		if ownedResult.Status != "cancelled" && ownedResult.Status != "timeout" {
-			t.Fatalf("daemon-owned cancel result = %+v", ownedResult)
+		ownedDecoy := exec.Command("/bin/sleep", "124")
+		ownedDecoy.Dir = owned
+		if err := ownedDecoy.Start(); err != nil {
+			t.Fatal(err)
 		}
+		ownedResult, ownedMessages := runRealClaudeCancel(t, backend, "Use Bash to run `sleep 128 & wait`, then answer OWNED_CANCEL_OK.", ExecOptions{Model: "claude-haiku-5-5", Cwd: owned, CwdOwnedByDaemon: true, Timeout: 5 * time.Minute})
+		if ownedResult.Status != "cancelled" || !hasToolUse(ownedMessages) {
+			t.Fatalf("daemon-owned cancel result = %+v messages=%+v", ownedResult, ownedMessages)
+		}
+		if state := processState(ownedDecoy.Process.Pid); state == "Z" || state == "" {
+			t.Fatalf("owned decoy state after cancellation = %q", state)
+		}
+		if processContains("sleep 128") {
+			t.Fatal("daemon-owned tool process survived cancellation")
+		}
+		_ = ownedDecoy.Process.Kill()
+		_ = ownedDecoy.Wait()
 	})
 
 	t.Run("unknown-modal-fails-closed", func(t *testing.T) {
@@ -153,6 +183,86 @@ func runRealClaudeTUIContext(t *testing.T, backend *claudeTUIBackend, ctx contex
 		messages = append(messages, message)
 	}
 	return result, messages
+}
+
+func runRealClaudeCancel(t *testing.T, backend *claudeTUIBackend, prompt string, opts ExecOptions) (Result, []Message) {
+	t.Helper()
+	if opts.Cwd == "" {
+		opts.Cwd = t.TempDir()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	session, err := backend.Execute(ctx, prompt, opts)
+	if err != nil {
+		t.Fatalf("real Claude execute: %v", err)
+	}
+	var messages []Message
+	messagesCh := session.Messages
+	var result Result
+	toolStarted := false
+	deadline := time.NewTimer(90 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case message, ok := <-messagesCh:
+			if !ok {
+				messagesCh = nil
+				continue
+			}
+			messages = append(messages, message)
+			if message.Type == MessageToolUse && !toolStarted {
+				toolStarted = true
+				cancel()
+			}
+		case result = <-session.Result:
+			if !toolStarted {
+				t.Fatal("cancel result arrived before a tool started")
+			}
+			return result, messages
+		case <-deadline.C:
+			t.Fatal("cancel acceptance timed out")
+		}
+	}
+}
+
+func hasToolUse(messages []Message) bool {
+	for _, message := range messages {
+		if message.Type == MessageToolUse {
+			return true
+		}
+	}
+	return false
+}
+
+func subtractTokenUsage(total, base TokenUsage) TokenUsage {
+	return TokenUsage{
+		InputTokens:      total.InputTokens - base.InputTokens,
+		OutputTokens:     total.OutputTokens - base.OutputTokens,
+		CacheReadTokens:  total.CacheReadTokens - base.CacheReadTokens,
+		CacheWriteTokens: total.CacheWriteTokens - base.CacheWriteTokens,
+		CostUSDTicks:     total.CostUSDTicks - base.CostUSDTicks,
+	}
+}
+
+func processState(pid int) string {
+	output, err := exec.Command("ps", "-o", "stat=", "-p", fmt.Sprint(pid)).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
+func processContains(fragment string) bool {
+	output, err := exec.Command("ps", "-axo", "pid=,ppid=,command=").Output()
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.Contains(line, fragment) && !strings.Contains(line, "processContains") && !strings.Contains(line, "go test") && !strings.Contains(line, "claude_tui_acceptance_test.go") {
+			return true
+		}
+	}
+	return false
 }
 
 type acceptanceBlocks struct {
