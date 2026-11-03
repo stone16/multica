@@ -244,8 +244,15 @@ func TestClaudeTUIHumanPromptRequiresPendingToolFooter(t *testing.T) {
 			t.Fatalf("healthy screen text matched interactive prompt: %q", screen)
 		}
 	}
-	if !tuiHumanPrompt("Do you want to proceed? ❯1. Yes 2. No Enter to confirm · Esc to cancel") {
-		t.Fatal("full interactive footer did not match")
+	for _, screen := range []string{
+		"Do you want to proceed? ❯1. Yes 2. No Enter to confirm · Esc to cancel",
+		"Do you want to create ok.txt? ❯ 1. Yes 2. No Esc to cancel · Tab to amend",
+		"Do you want to make this edit to e.txt? ❯ 1. Yes 2. No Esc to cancel · Tab to amend",
+		"Do you want to allow Claude to fetch this content? ❯ 1. Yes 2. Yes, and don't ask again for example.com 3. No, and tell Claude what to do differently (esc)",
+	} {
+		if !tuiHumanPrompt(screen) {
+			t.Errorf("full interactive footer did not match: %q", screen)
+		}
 	}
 	if !tuiComposerReady("old answer: Enter to confirm · Esc to cancel\n❯\u00a0") {
 		t.Fatal("replayed history blocked the current composer")
@@ -273,7 +280,7 @@ func TestClaudeTUIProcessRowsTrackPendingTools(t *testing.T) {
 }
 
 func TestClaudeTUIQuotedScreenAndBlockingModal(t *testing.T) {
-	for _, scenario := range []string{"quote", "tool-quote", "modal"} {
+	for _, scenario := range []string{"quote", "tool-quote", "modal", "write-modal"} {
 		t.Run(scenario, func(t *testing.T) {
 			home, cwd := t.TempDir(), t.TempDir()
 			fake := filepath.Join(t.TempDir(), "claude.py")
@@ -294,11 +301,13 @@ with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(value) + "\n"); f.flush()
     row({"type":"user", "message":{"content":buf.decode()}, "sessionId":sid, "cwd":os.getcwd(), "entrypoint":"cli"})
     scenario = os.environ["TUI_SCENARIO"]
+    if scenario == "write-modal":
+        footer = "Do you want to create ok.txt? ❯ 1. Yes 2. No Esc to cancel · Tab to amend"
     if scenario != "quote":
-        row({"type":"assistant", "message":{"id":"tool", "content":[{"type":"tool_use", "id":"call", "name":"Bash", "input":{"command":"echo Do you want to proceed?"}}]}})
+        row({"type":"assistant", "message":{"id":"tool", "content":[{"type":"tool_use", "id":"call", "name":"Write" if scenario == "write-modal" else "Bash", "input":{}}]}})
     os.write(1, (footer if scenario != "tool-quote" else "echo Do you want to proceed?").encode())
     time.sleep(0.3)
-    if scenario != "modal":
+    if scenario not in ("modal", "write-modal"):
         row({"type":"user", "message":{"content":[{"type":"tool_result", "tool_use_id":"call", "content":"Do you want to proceed?"}]}})
         row({"type":"assistant", "message":{"id":"answer", "content":[{"type":"text", "text":footer}], "stop_reason":"end_turn"}})
         row({"type":"system", "subtype":"turn_duration", "terminal_reason":"end_turn"})
@@ -314,7 +323,7 @@ time.sleep(60)
 			}
 			select {
 			case result := <-session.Result:
-				if scenario == "modal" {
+				if scenario == "modal" || scenario == "write-modal" {
 					if result.Status != "failed" || !strings.Contains(result.Error, "interactive confirmation") {
 						t.Fatalf("blocking modal result = %+v", result)
 					}

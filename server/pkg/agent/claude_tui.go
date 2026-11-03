@@ -419,12 +419,6 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 			mu.Unlock()
 		case <-ticker.C:
 			mu.Lock()
-			compact := strings.Map(func(r rune) rune {
-				if unicode.IsSpace(r) {
-					return -1
-				}
-				return r
-			}, tuiScreenText(screen.String()))
 			if !trustAccepted && trustModalSeen && !trustSince.IsZero() && time.Since(trustSince) > 300*time.Millisecond {
 				if trustMoves == 0 {
 					_, _ = master.Write([]byte("\x1b[B"))
@@ -453,6 +447,7 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 				enterAttempts = 1
 				enterAt = time.Now()
 			}
+			screenText := tuiScreenText(screen.String())
 			mu.Unlock()
 			if err := b.readTUITranscript(cfgDir, sessionID, pathOffsets, messages, usage, usageBaseline, seenMessage, &finalText, &finalErr, &sawResult, &terminalReason, &promptRows, opts.Cwd); err != nil {
 				finalErr = err.Error()
@@ -489,7 +484,7 @@ func (b *claudeTUIBackend) consumeTUI(ctx context.Context, cancel context.Cancel
 					}
 				}
 			}
-			if promptRows > 0 && !sawResult && hasPendingTUITool(seenMessage) && tuiHumanPrompt(compact) {
+			if promptRows > 0 && !sawResult && hasPendingTUITool(seenMessage) && tuiHumanPrompt(screenText) {
 				errText := "claude tui is waiting for interactive confirmation"
 				claudeTUIStop(cmd, opts, procDone, rootStart)
 				_, _ = watchdogW.WriteString("done\n")
@@ -622,7 +617,9 @@ func tuiHumanPrompt(screen string) bool {
 		}
 		return r
 	}, screen)
-	return (strings.Contains(compact, "Doyouwanttoproceed?") || strings.Contains(compact, "Entertoconfirm")) && strings.Contains(compact, "❯1.") && strings.Contains(compact, "Esc")
+	return (strings.Contains(compact, "Doyouwantto") || strings.Contains(compact, "Entertoconfirm")) &&
+		strings.Contains(compact, "❯1.") &&
+		(strings.Contains(compact, "Esc") || strings.Contains(compact, "(esc)"))
 }
 
 func hasPendingTUITool(seen map[string]struct{}) bool {

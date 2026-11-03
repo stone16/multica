@@ -134,6 +134,31 @@ func TestClaudeTUIRealAcceptance(t *testing.T) {
 		}
 	})
 
+	t.Run("write-ask-rule-fails-closed", func(t *testing.T) {
+		cwd := t.TempDir()
+		settings := filepath.Join(t.TempDir(), "settings.json")
+		if err := os.WriteFile(settings, []byte(`{"permissions":{"ask":["Write"]}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		started := time.Now()
+		result, messages := runRealClaudeTUI(t, backend, "Use the Write tool to create ask-rule.txt containing exactly ASK_OK, then answer exactly WRITE_OK. Do not use Bash or any other tool.", ExecOptions{Model: "claude-haiku-5-5", Cwd: cwd, ClaudeSettingsPath: settings, Timeout: 30 * time.Second})
+		if result.Status != "failed" || !strings.Contains(result.Error, "interactive confirmation") || time.Since(started) > 15*time.Second {
+			t.Fatalf("Write ask-rule result after %s = %+v", time.Since(started), result)
+		}
+		var sawWrite bool
+		for _, message := range messages {
+			if message.Type == MessageToolUse && message.Tool == "Write" {
+				sawWrite = true
+			}
+		}
+		if !sawWrite {
+			t.Fatal("Write ask rule was not exercised")
+		}
+		if _, err := os.Stat(filepath.Join(cwd, "ask-rule.txt")); !os.IsNotExist(err) {
+			t.Fatalf("unapproved Write file stat = %v, want not exist", err)
+		}
+	})
+
 	t.Run("refused-resume", func(t *testing.T) {
 		result, _ := runRealClaudeTUI(t, backend, "Answer exactly NEVER.", ExecOptions{Model: "claude-haiku-5-5", ResumeSessionID: uuid.NewString(), Timeout: 45 * time.Second})
 		if result.Status != "failed" || !result.ResumeRejected || result.SessionID != "" {
