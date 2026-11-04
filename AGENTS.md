@@ -2,6 +2,9 @@
 
 This file provides guidance to AI agents when working with code in this repository.
 
+## Stometa / verification
+User-facing changes: follow the repo skill `stometa-mode` (Self-prove). Before claiming done, drive affected features with the repo `verify-*` skill.
+
 ## Project Context
 
 Multica is an AI-native task management platform — like Linear, but with AI agents as first-class citizens.
