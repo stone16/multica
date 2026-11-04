@@ -3,7 +3,7 @@ name: stometa-mode
 description: Work in Stometa's delegated, independently reviewed, live-verified style. Use when a development task runs under /stometa-mode or the user asks for Stometa's style. Not for prose in Stometa's public voice.
 disable-model-invocation: true
 metadata:
-  version: 1.1.0
+  version: 1.2.0
   author: stometa
 ---
 
@@ -57,6 +57,15 @@ Done means the user could see it working in the real environment. Merged, CI gre
 - After a deploy, confirm the live URL serves the new version.
 - When the user marks up a round, fix all of it and re-screenshot before showing the next round.
 
+### Self-prove on user-facing diffs
+
+When your change touches a user-facing surface — routes, menus, visible copy, CLI commands, or anything listed under the repo's `verify-*/features/` — you must prove it before claiming done. Do not wait for a cron, a reviewer, or the user to ask.
+
+1. Load the repo's `verify-<app>` skill (or generate one with pstack `create-verification-skill` when the surface is driveable and none exists).
+2. Run `doctor`, then drive only the affected feature(s). Put the evidence in the PR. Do not drive the whole map unless the change spans it.
+3. Classify failures: if the harness cannot find controls, routes, or entry points the map names, treat it as map drift — run `/maintain-verification-skill` (skill directory only), then re-drive. If the harness finds the path but the product behavior is wrong, fix the product; never loosen the map to make a broken journey pass.
+4. Pure docs, CI, or non-surface refactors skip this gate. Say `skip: no user-facing surface` in the todolist when that applies.
+
 ## Showing work
 
 Show the thing itself: open the file, the folder, or the diff. For a visual decision, build a local page with several variants in their real page context, ranked best first with scores, and open it. Keep drafts and comparison pages in local files, because the user's network reaches hosted pages slowly.
@@ -95,7 +104,7 @@ Development work moves through the stages below. Reach for the named skill at ea
 | Read before changing | pstack `how` and `why` |
 | Design | pstack `architect`; `arena` without precedent; `interrogate` when contested; `statechart` for state machines; the prototype playbook for a question an experiment can answer |
 | Implement | pstack playbooks `feature`, `bug-fix`, `refactoring`, `perf-issue`; Matt `diagnosing-bugs` before a bug fix |
-| Prove it | the repo's `verify-<app>` skill (generate one with pstack `create-verification-skill`), `blast-radius`, `benchmark-checklist`; `show-me-your-work` on unattended runs |
+| Prove it | on user-facing diffs: the repo's `verify-<app>` (affected features only; see Verification); else generate with pstack `create-verification-skill`. Also `blast-radius`, `benchmark-checklist`; `show-me-your-work` on unattended runs |
 | Cold review | pstack `interrogate` and Matt `code-review`; `no-comments` first |
 | Ship | pstack playbooks `opening-a-pr`, `babysit`, `shipping` |
 | Learn | pstack `reflect`, then `correct`; test a skill edit with the `eval` playbook |
