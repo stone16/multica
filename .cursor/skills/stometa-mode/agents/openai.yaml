@@ -1,0 +1,6 @@
+interface:
+  display_name: "Stometa Mode"
+  short_description: "Work in Stometa's delegated, reviewed, live-verified style"
+  default_prompt: "Use $stometa-mode to work on this task in Stometa's style."
+policy:
+  allow_implicit_invocation: false
