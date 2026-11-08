@@ -2,6 +2,9 @@
 
 This file provides guidance to AI agents when working with code in this repository.
 
+## Stometa / verification
+User-facing changes: follow the repo skill `stometa-mode` (Self-prove). Before claiming done, drive affected features with the repo `verify-*` skill.
+
 ## Project Context
 
 Multica is an AI-native task management platform — like Linear, but with AI agents as first-class citizens.
@@ -272,3 +275,7 @@ test("example", async ({ page }) => {
   // api.cleanup() in afterEach removes the issue
 });
 ```
+
+## Development verification
+
+For development work, read `.cursor/skills/stometa-mode/SKILL.md`. For changes to a user-facing journey, explicitly read the repository's applicable `verify-*` skill, even if that skill is configured for manual invocation. Use its isolated setup, run the applicable repository checks, and report evidence and untested paths.

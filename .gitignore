@@ -35,7 +35,8 @@ apps/web/test-results/
 .context
 
 # local settings
-.claude/
+.claude/*
+!.claude/skills/
 .tool-versions
 
 # feature tracking
