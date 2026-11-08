@@ -41,7 +41,7 @@ That command runs these steps:
 - **Return to the list.** `browser click --role link --name Issues --exact`.
 - **Cancel a draft.** Open the composer again, type `Discard me` into `Issue title`, hover the second tooltip trigger inside `[data-slot='dialog-content']`, confirm the tooltip `Close`, and click it. The dialog count is 0. The link count for `Discard me` is 0. The `Release checklist` link is still visible.
 - **Mobile shot.** Set the viewport to 390 by 844 and run `browser screenshot --path create-issue/board-mobile.png`. Then restore 1280 by 800.
-- **API proof.** `browser storage` prints the token and workspace id. `GET $NEXT_PUBLIC_API_URL/api/issues?limit=50` with `Authorization: Bearer <token>` and `X-Workspace-ID: <workspace id>` returns `Release checklist` and does not return `Discard me`. The body is saved as `create-issue/api-issues.json`.
+- **API proof.** `browser issue-api-proof` requests `GET /api/issues?limit=50` with the isolated session credentials without printing them. The response returns `Release checklist` and does not return `Discard me`. The body is saved as `create-issue/api-issues.json`.
 
 ## Gotchas
 

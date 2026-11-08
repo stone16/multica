@@ -162,15 +162,20 @@ async function handle(body) {
     await page.setViewportSize({ width: Number(body.width), height: Number(body.height) });
     return {};
   }
-  if (body.op === "storage") {
-    const data = await page.evaluate(() => ({
+  if (body.op === "issue-api-proof") {
+    const session = await page.evaluate(() => ({
       token: localStorage.getItem("multica_token"),
       workspaceId: localStorage.getItem("multica_workspace_id"),
     }));
-    if (!data.token || !data.workspaceId) {
-      throw new Error(`missing session storage ${JSON.stringify(data)}`);
-    }
-    return data;
+    if (!session.token || !session.workspaceId) throw new Error("missing session storage");
+    const response = await context.request.get(`${meta.NEXT_PUBLIC_API_URL}/api/issues?limit=50`, {
+      headers: { Authorization: `Bearer ${session.token}`, "X-Workspace-ID": session.workspaceId },
+    });
+    if (!response.ok()) throw new Error(`issue API returned ${response.status()}`);
+    const path = evidencePath("create-issue/api-issues.json");
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, await response.text());
+    return { path };
   }
   if (body.op === "url") return { url: page.url() };
   if (body.op === "quit") {

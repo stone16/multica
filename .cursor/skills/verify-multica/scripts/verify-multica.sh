@@ -487,16 +487,7 @@ drive_create_issue() {
   browser_http viewport --width 390 --height 844
   browser_http screenshot --path create-issue/board-mobile.png
   browser_http viewport --width 1280 --height 800
-  local storage token workspace body
-  storage=$(browser_http storage)
-  token=$(printf '%s' "$storage" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
-  workspace=$(printf '%s' "$storage" | python3 -c 'import json,sys; print(json.load(sys.stdin)["workspaceId"])')
-  mkdir -p "$EVIDENCE_DIR/create-issue"
-  curl -sf \
-    -H "Authorization: Bearer $token" \
-    -H "X-Workspace-ID: $workspace" \
-    "$NEXT_PUBLIC_API_URL/api/issues?limit=50" \
-    > "$EVIDENCE_DIR/create-issue/api-issues.json"
+  browser_http issue-api-proof
   python3 - "$EVIDENCE_DIR/create-issue/api-issues.json" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1]))
